@@ -1,0 +1,23 @@
+# Keep the build context minimal: only src/, templates/, main.py and
+# requirements.txt are needed to build the image.
+.git
+.gitignore
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.coverage
+.env
+.env.example
+data/
+tests/
+pytest.ini
+requirements-dev.txt
+.github/
+.claude/
+Makefile
+docker-compose.yml
+*.md
+*.code-workspace
+.DS_Store

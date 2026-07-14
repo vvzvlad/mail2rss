@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<meta name="robots" content="noindex, nofollow, noarchive">
+<title>${title}</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { max-width: 44rem; margin: 2rem auto; padding: 0 1rem;
+         font-family: system-ui, -apple-system, sans-serif; line-height: 1.6; }
+  header { border-bottom: 1px solid #8884; padding-bottom: 0.6rem; margin-bottom: 1rem; }
+  h1 { font-size: 1.3rem; margin: 0 0 0.3rem; }
+  .meta { color: #8889; font-size: 0.85rem; }
+  article img { max-width: 100%; height: auto; }
+  article table { border-collapse: collapse; max-width: 100%; }
+  article td, article th { padding: 0.2rem 0.4rem; }
+  a { color: #06c; }
+  @media (prefers-color-scheme: dark) {
+    body { background: #111; color: #eee; }
+    a { color: #6cf; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>${title}</h1>
+  <div class="meta">${meta}</div>
+</header>
+<article>${content}</article>
+</body>
+</html>

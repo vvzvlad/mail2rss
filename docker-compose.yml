@@ -1,0 +1,141 @@
+# Deploy template for mail2rss. Pull the prebuilt image from ghcr.io — do NOT build on prod.
+# Every value below is a PLACEHOLDER (XXX / example.com), never a real secret.
+#
+# This file doubles as env documentation: each variable is annotated with its
+# meaning and default. The full list also lives in .env.example (SPEC.md §10.2).
+
+volumes:
+  mail2rss:
+
+networks:
+  docker_main_net:
+    external: true
+
+services:
+  mail2rss:
+    image: ghcr.io/vvzvlad/mail2rss:latest
+    container_name: mail2rss
+    restart: always
+    volumes:
+      # Disposable SQLite cache (feed bodies, media blobs, mailbox tree). Deleting the
+      # volume loses nothing — every URL is re-derived from MAIL2RSS_SECRET. It is a
+      # volume anyway so that a restart or a watchtower update does not leave every feed cold.
+      - mail2rss:/app/data
+    environment:
+      # --- Required. No defaults: the service refuses to start if any is missing. ---
+
+      # Fastmail JMAP API token. Type: JMAP, scopes "Read-only access" + "Email".
+      # Not available on the Basic plan. See README.
+      FASTMAIL_API_TOKEN: XXX
+
+      # 128-bit base32 secret (26 lowercase chars, no padding) — `make gen-secret`.
+      # EVERY feed and media URL is derived from it, and its format is validated at
+      # startup. BACK IT UP: losing it changes every feed URL.
+      MAIL2RSS_SECRET: XXX
+
+      # Public https URL of THIS service — it is baked into the links inside the feed.
+      # No default on purpose: a localhost default would ship broken links to the reader.
+      BASE_URL: https://rss.example.com
+
+      # --- Optional. Uncomment only to override the default shown. ---
+
+      # Fastmail JMAP session endpoint (public third-party API, so a default is fine).
+      # JMAP_SESSION_URL: https://api.fastmail.com/jmap/session
+
+      # Seconds a rendered feed is served from cache before JMAP is queried again.
+      # CACHE_TTL: "600"
+
+      # Server-side ceiling on ?limit=, forced regardless of what the URL signature says.
+      # MAX_LIMIT: "100"
+
+      # Seconds the mailbox tree is cached; a new folder becomes visible without a restart.
+      # MAILBOX_TREE_TTL: "3600"
+
+      # Per-folder URL revocation counters, e.g. "M9f3ac21b:2,M77bb01c:5" (SPEC.md §4.7).
+      # Bumping a counter changes the URL of that folder only. Empty by default.
+      # MAIL2RSS_EPOCH: ""
+
+      # LOG_LEVEL: INFO
+
+      # SQLite cache file — always under data/, which is the mounted volume.
+      # CACHE_DB_PATH: data/cache.db
+
+      TZ: Europe/Moscow
+    networks:
+      - docker_main_net
+    logging:
+      driver: "json-file"
+      options:
+        max-file: 5
+        max-size: 10m
+    labels:
+      traefik.enable: "true"
+      traefik.http.routers.mail2rss.rule: Host(`rss.example.com`)
+      traefik.http.services.mail2rss.loadBalancer.server.port: 8000
+      traefik.http.routers.mail2rss.entrypoints: websecure
+      traefik.http.routers.mail2rss.tls: "true"
+      traefik.http.routers.mail2rss.tls.certresolver: letsEncrypt
+      com.centurylinklabs.watchtower.enable: "true"   # auto-update the image
+    healthcheck:
+      # Short interval + start_period are REQUIRED behind Traefik: Traefik does not
+      # route to a container while its health is starting/unhealthy, so a long interval
+      # with no start_period leaves it unrouted for minutes (default cert + 404).
+      test: ["CMD", "curl", "-s", "-f", "-o", "/dev/null", "http://127.0.0.1:8000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  # --- Miniflux (the reader) ---------------------------------------------------
+  # Not part of mail2rss; shown because ONE of its settings is a hard requirement.
+  #
+  # MEDIA_PROXY_MODE=all is REQUIRED (SPEC.md §8.2). Miniflux defaults to
+  # `http-only`, which does NOT proxy https images — so every remote image in a
+  # newsletter is fetched by the reader's browser, leaking the reader's IP (and the
+  # fact that the mail was opened) to the sender. With `all`, Miniflux fetches the
+  # images from its own server instead.
+  #
+  # miniflux:
+  #   image: miniflux/miniflux:latest
+  #   container_name: miniflux
+  #   restart: always
+  #   depends_on:
+  #     - miniflux_db
+  #   environment:
+  #     DATABASE_URL: postgres://miniflux:XXX@miniflux_db/miniflux?sslmode=disable
+  #     RUN_MIGRATIONS: "1"
+  #     CREATE_ADMIN: "1"
+  #     ADMIN_USERNAME: XXX
+  #     ADMIN_PASSWORD: XXX
+  #     MEDIA_PROXY_MODE: all            # REQUIRED — see above. Do not leave the default.
+  #     MEDIA_PROXY_RESOURCE_TYPES: image
+  #     TZ: Europe/Moscow
+  #   networks:
+  #     - docker_main_net
+  #   labels:
+  #     traefik.enable: "true"
+  #     traefik.http.routers.miniflux.rule: Host(`reader.example.com`)
+  #     traefik.http.services.miniflux.loadBalancer.server.port: 8080
+  #     traefik.http.routers.miniflux.entrypoints: websecure
+  #     traefik.http.routers.miniflux.tls: "true"
+  #     traefik.http.routers.miniflux.tls.certresolver: letsEncrypt
+  #
+  # miniflux_db:
+  #   image: postgres:17-alpine
+  #   container_name: miniflux_db
+  #   restart: always
+  #   environment:
+  #     POSTGRES_USER: miniflux
+  #     POSTGRES_PASSWORD: XXX
+  #     POSTGRES_DB: miniflux
+  #   volumes:
+  #     - miniflux_db:/var/lib/postgresql/data
+  #   networks:
+  #     - docker_main_net
+  #   healthcheck:
+  #     test: ["CMD", "pg_isready", "-U", "miniflux"]
+  #     interval: 10s
+  #     start_period: 30s
+  #
+  # Add to the top-level `volumes:` block when enabling Miniflux:
+  #   miniflux_db:

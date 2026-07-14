@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<meta name="robots" content="noindex, nofollow, noarchive">
+<title>mail2rss — feed links</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { max-width: 52rem; margin: 2rem auto; padding: 0 1rem;
+         font-family: system-ui, -apple-system, sans-serif; line-height: 1.5; }
+  h1 { font-size: 1.4rem; }
+  form.auth { margin: 1rem 0; padding: 1rem; border: 1px solid #8884; border-radius: 8px; }
+  label { display: block; margin: 0.4rem 0; }
+  input[type=password] { width: 100%; max-width: 24rem; padding: 0.4rem; box-sizing: border-box; }
+  button { padding: 0.4rem 0.8rem; cursor: pointer; }
+  ul.folders { list-style: none; padding: 0; }
+  li.folder { margin: 0.6rem 0; padding: 0.6rem; border: 1px solid #8884; border-radius: 6px; }
+  .path { font-weight: 600; }
+  .count { color: #8889; font-size: 0.85rem; }
+  .url { font-family: ui-monospace, monospace; font-size: 0.8rem; width: 100%;
+         box-sizing: border-box; padding: 0.3rem; margin: 0.2rem 0; }
+  .error { padding: 0.6rem 0.8rem; border-radius: 6px; background: #f882;
+           border: 1px solid #f884; margin: 1rem 0; }
+  .muted { color: #8889; font-size: 0.85rem; }
+  @media (prefers-color-scheme: dark) {
+    body { background: #111; color: #eee; }
+    input, .url { background: #222; color: #eee; border: 1px solid #444; }
+  }
+</style>
+</head>
+<body>
+<main>
+<h1>mail2rss</h1>
+<p class="muted">Paste your secret to list your Fastmail folders and copy ready-made Atom feed URLs for Miniflux. Nothing is stored; the secret is used only to compute this page.</p>
+${error}
+<form class="auth" method="post" action="/" autocomplete="off">
+  <label>Secret
+    <input type="password" name="secret" autocomplete="off" spellcheck="false" autocapitalize="none" required>
+  </label>
+  <label><input type="checkbox" name="show_all" value="1" ${show_all_checked}> show system folders (Inbox, Archive, …)</label>
+  <button type="submit">List folders</button>
+</form>
+${content}
+</main>
+${script}
+</body>
+</html>
