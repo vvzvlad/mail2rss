@@ -543,11 +543,9 @@ async def _force_tree_refresh(tree: MailboxTree) -> None:
 
     Used only before declaring a folder permanently gone off a stale/kv-restored
     tree, so a cold/stale snapshot is never persisted as a permanent "deleted"
-    verdict. Reaches into the tree's own lock/refresh to bypass the TTL freshness
-    gate that ensure_fresh() applies; on a failing refresh with an existing tree,
-    _refresh() keeps the stale tree and returns without raising."""
-    async with tree._lock:  # noqa: SLF001 - deliberate: force a refresh past the TTL
-        await tree._refresh()  # noqa: SLF001
+    verdict. On a failing refresh with an existing tree, the tree stays stale and
+    this returns without raising."""
+    await tree.force_refresh()
 
 
 async def _in_thread_render(emails, mailbox_id, mac, signed_params, title):

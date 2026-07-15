@@ -100,6 +100,16 @@ class MailboxTree:
                 return
             await self._refresh()
 
+    async def force_refresh(self) -> None:
+        """Rebuild the tree once regardless of the TTL freshness gate.
+
+        Used before declaring a folder permanently gone off a stale/kv-restored
+        tree (SPEC.md §6.1). On a failing refresh with an existing tree, _refresh()
+        keeps the stale tree and returns without raising.
+        """
+        async with self._lock:
+            await self._refresh()
+
     async def _refresh(self) -> None:
         try:
             boxes = await self._jmap.get_mailboxes()
