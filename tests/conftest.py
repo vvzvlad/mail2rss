@@ -10,11 +10,15 @@ time.tzset()
 
 # Provide the required credentials BEFORE any test module imports src.settings
 # (Settings() is instantiated at import time and would otherwise fail at startup).
-# In CI the same variables are injected via the workflow's `env:` block.
+#
+# Assign, do NOT setdefault: the suite asserts against these exact values
+# (discovery tests POST TEST_SECRET and expect 200), so an ambient
+# MAIL2RSS_SECRET — e.g. the CI workflow's `env:` block — would make every
+# authorized request fail with 401 while the app waits for a different secret.
 #
 # TEST_SECRET is a real, canonical machine-generated secret (26 chars, a-z2-7):
 # validate_secret() must accept it, or importing src.settings would exit(1).
 TEST_SECRET = "o2au6sdynfj7xokdurkazuwhoy"
-os.environ.setdefault("FASTMAIL_API_TOKEN", "test-token")
-os.environ.setdefault("MAIL2RSS_SECRET", TEST_SECRET)
-os.environ.setdefault("BASE_URL", "https://rss.example.test")
+os.environ["FASTMAIL_API_TOKEN"] = "test-token"
+os.environ["MAIL2RSS_SECRET"] = TEST_SECRET
+os.environ["BASE_URL"] = "https://rss.example.test"
