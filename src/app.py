@@ -32,7 +32,7 @@ import time
 import uuid
 from html import escape
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from email.utils import format_datetime, parsedate_to_datetime
 from urllib.parse import quote
 
@@ -164,15 +164,21 @@ class RequestLoggingMiddleware:
 
 
 def _scrub_path(path: str) -> str:
-    """A log-safe description of the path with the mac replaced by a hash.
+    """A log-safe description of the path with capability components hashed out.
 
     The mac is a capability token and must never appear in a log (SPEC.md §5.2
-    p.5); the query string is dropped entirely so a stray secret cannot leak."""
+    p.5); the query string is dropped entirely so a stray secret cannot leak. On a
+    media path (``/f/{slug}/{mailbox_id}/{mac}/m/{blob_id}/{sig}/{name}``) the
+    ``sig`` (and ``blob_id``) are capability components too — hash them the same
+    way as the mac so none of them reaches the logs."""
     parts = path.split("/")
     if len(parts) >= 5 and parts[1] == "f":
         mailbox_id = parts[3]
         mac_hash = hashlib.sha256(parts[4].encode("utf-8")).hexdigest()[:6]
         parts[4] = f"mac#{mac_hash}"
+        if len(parts) >= 8 and parts[5] == "m":
+            parts[6] = "blob#" + hashlib.sha256(parts[6].encode("utf-8")).hexdigest()[:6]
+            parts[7] = "sig#" + hashlib.sha256(parts[7].encode("utf-8")).hexdigest()[:6]
         return f"mailbox_id {mailbox_id}, mac_hash {mac_hash}, route {'/'.join(parts)}"
     return f"path {path}"
 
@@ -328,6 +334,25 @@ def _entry_title(email: Email) -> str:
     return f"(no subject) — {who} — {day}"[:MAX_TITLE_LEN]
 
 
+def _fallback_seed(email: Email) -> str:
+    """Seed for ``atom:id`` when an email has no Message-ID (SPEC.md §7.2).
+
+    Built ONLY from stable content fields — ``receivedAt ‖ from ‖ subject ‖
+    preview`` — never from the JMAP ``Email.id``: a thread merge can recreate the
+    email with a new id (RFC 8621), which would resurface the entry as unread. The
+    Email.id stays a cache key and part of the permalink URL only. ``entry_id``
+    hashes this seed with sha256."""
+    from_field = email.from_email or email.from_name or ""
+    return "\x00".join(
+        (
+            email.received_at.isoformat(),
+            from_field,
+            email.subject or "",
+            email.preview or "",
+        )
+    )
+
+
 def _categories(email: Email) -> tuple[str, ...]:
     cats: list[str] = []
     if email.list_id:
@@ -374,7 +399,7 @@ def _render_feed_body(
 
         entries.append(
             FeedEntry(
-                id=entry_id(email.message_id, fallback_seed=email.id),
+                id=entry_id(email.message_id, fallback_seed=_fallback_seed(email)),
                 title=_entry_title(email),
                 link=permalink,
                 author_name=email.from_name,
@@ -394,9 +419,26 @@ def _render_feed_body(
     return body, newest
 
 
+# Deterministic base + spread for the error feed's dates. A datetime.now()
+# fallback is forbidden (SPEC.md §7.3/§14.2): it makes the error feed's body,
+# ETag and <updated> jitter on every regeneration. The base and span stay firmly
+# in the PAST so a reader never sees a future-dated entry (which it would ignore).
+_ERROR_FEED_BASE = datetime(2020, 1, 1, tzinfo=timezone.utc)
+_ERROR_FEED_SPAN_S = 365 * 24 * 3600  # one year of deterministic spread
+
+
+def _error_feed_when(mailbox_id: str) -> datetime:
+    """A stable, byte-deterministic timestamp for the error feed, derived from the
+    mailbox_id — aligned with the stable atom:id so the whole document is fixed."""
+    digest = hashlib.sha256(("error:" + mailbox_id).encode("utf-8")).digest()
+    offset = int.from_bytes(digest[:4], "big") % _ERROR_FEED_SPAN_S
+    return _ERROR_FEED_BASE + timedelta(seconds=offset)
+
+
 def _build_error_feed(mailbox_id: str, mac: str, slug: str, signed_params: FeedParams) -> bytes:
     """A valid Atom feed with one explanation entry (SPEC.md §6.4). The entry id is
-    STABLE (uuid5 of "error:"+mailbox_id) so it never resurfaces as unread."""
+    STABLE (uuid5 of "error:"+mailbox_id) and the date is DETERMINISTIC, so the
+    whole document is byte-stable across polls (no resurfacing as unread)."""
     feed_id = f"urn:uuid:{uuid.uuid5(NS_MAIL2RSS, mailbox_id)}"
     stable_id = f"urn:uuid:{uuid.uuid5(NS_MAIL2RSS, 'error:' + mailbox_id)}"
     self_url = feed_url(settings.base_url, slug, mailbox_id, mac, signed_params)
@@ -410,7 +452,7 @@ def _build_error_feed(mailbox_id: str, mac: str, slug: str, signed_params: FeedP
         self_url=self_url,
         entry_id_=stable_id,
         message=message,
-        when=datetime.now(timezone.utc),
+        when=_error_feed_when(mailbox_id),
     )
 
 
@@ -443,8 +485,20 @@ async def feed(slug: str, mailbox_id: str, mac: str, request: Request) -> Respon
         await tree.ensure_fresh()
         mailbox = tree.get(mailbox_id)
         if mailbox is None:
-            # Permanent: the folder is gone -> explanation feed, not a bare 410.
-            return await _serve_error_feed(request, cache, cache_key, mailbox_id, mac, slug, signed_params)
+            # A stale or kv-restored tree can report a genuinely-existing folder as
+            # gone. Before persisting a permanent "deleted" verdict, force ONE real
+            # refresh when the current tree was never successfully refreshed this
+            # run (SPEC.md §6.1): don't turn a cold/stale tree into a cached
+            # permanent-gone.
+            if tree.last_refresh_ok is not True:
+                try:
+                    await _force_tree_refresh(tree)
+                except (JmapError, JmapNotFound):
+                    pass  # keep whatever tree we have; fall through to the error feed
+                mailbox = tree.get(mailbox_id)
+            if mailbox is None:
+                # Permanent: the folder is gone -> explanation feed, not a bare 410.
+                return await _serve_error_feed(request, mailbox_id, mac, slug, signed_params)
         fetch_ids = [mailbox_id]
         if signed_params.children:
             fetch_ids += tree.children_ids(mailbox_id)
@@ -452,7 +506,7 @@ async def feed(slug: str, mailbox_id: str, mac: str, request: Request) -> Respon
         health.record(True)
     except JmapNotFound:
         health.record(True)  # a definite answer from JMAP: the thing is gone
-        return await _serve_error_feed(request, cache, cache_key, mailbox_id, mac, slug, signed_params)
+        return await _serve_error_feed(request, mailbox_id, mac, slug, signed_params)
     except JmapError as exc:
         health.record(False, repr(exc))
         # Never return an empty-but-valid feed on an upstream error (SPEC.md §6.4).
@@ -465,10 +519,35 @@ async def feed(slug: str, mailbox_id: str, mac: str, request: Request) -> Respon
         return Response(status_code=503, headers={"Retry-After": "300"})
 
     title = tree.title(mailbox_id)
-    body, _newest = await _in_thread_render(emails, mailbox_id, mac, signed_params, title)
+    try:
+        body, _newest = await _in_thread_render(emails, mailbox_id, mac, signed_params, title)
+    except Exception as exc:  # noqa: BLE001 - the render/serialise path must never 500
+        # Even after the F17 strip + build_atom fail-safe, render/serialise is a
+        # single point of failure. Mirror the transient-JMAP handling (SPEC.md
+        # §6.4): serve a stale body if we have one, else 503 — never a 500, and
+        # never an empty-but-valid feed.
+        if entry is not None:
+            logger.warning(f"feed_render_failed_served_stale: mailbox_id {mailbox_id}, error {exc!r}")
+            return _feed_response(
+                request, entry.body, entry.etag, extra_headers={"X-Upstream-Status": "stale"}
+            )
+        logger.error(f"feed_render_failed_no_cache: mailbox_id {mailbox_id}, error {exc!r}")
+        return Response(status_code=503, headers={"Retry-After": "300"})
     etag = _strong_etag(body)
     await cache.put_feed(cache_key, body, etag, time.time())
     return _feed_response(request, body, etag)
+
+
+async def _force_tree_refresh(tree: MailboxTree) -> None:
+    """Force ONE tree rebuild regardless of TTL (SPEC.md §6.1).
+
+    Used only before declaring a folder permanently gone off a stale/kv-restored
+    tree, so a cold/stale snapshot is never persisted as a permanent "deleted"
+    verdict. Reaches into the tree's own lock/refresh to bypass the TTL freshness
+    gate that ensure_fresh() applies; on a failing refresh with an existing tree,
+    _refresh() keeps the stale tree and returns without raising."""
+    async with tree._lock:  # noqa: SLF001 - deliberate: force a refresh past the TTL
+        await tree._refresh()  # noqa: SLF001
 
 
 async def _in_thread_render(emails, mailbox_id, mac, signed_params, title):
@@ -484,17 +563,17 @@ async def _in_thread_render(emails, mailbox_id, mac, signed_params, title):
 
 async def _serve_error_feed(
     request: Request,
-    cache: Cache,
-    cache_key: str,
     mailbox_id: str,
     mac: str,
     slug: str,
     signed_params: FeedParams,
 ) -> Response:
+    # Do NOT cache the explanation feed (SPEC.md §6.1/§6.4): caching it for
+    # cache_ttl would persist a "folder deleted" verdict that may really be just a
+    # cold/stale tree. The body is byte-deterministic (stable id + deterministic
+    # date), so regenerating it on every poll is cheap and still 304-able.
     body = _build_error_feed(mailbox_id, mac, slug, signed_params)
     etag = _strong_etag(body)
-    # Cache it so repeated polls within the TTL are cheap and 304-able.
-    await cache.put_feed(cache_key, body, etag, time.time())
     return _feed_response(request, body, etag)
 
 

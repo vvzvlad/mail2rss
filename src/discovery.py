@@ -17,6 +17,7 @@ is not re-policed here.
 
 from __future__ import annotations
 
+import base64
 import hmac
 import re
 import time
@@ -39,6 +40,9 @@ TEMPLATES_DIR = Path(__file__).resolve().parent.parent / "templates"
 # Anti-DoS budget for the discovery form (SPEC.md §4.4 p.3).
 RATE_LIMIT = 5
 RATE_WINDOW_S = 60.0
+# Hard cap on how many IPs the limiter tracks, so the map can never grow without
+# bound (SPEC.md §5 "caches without caps").
+RATE_MAX_IPS = 10_000
 
 _PLACEHOLDER_RE = re.compile(r"\$\{(\w+)\}")
 
@@ -67,15 +71,23 @@ def render_template(name: str, mapping: dict[str, str]) -> str:
 
 
 class RateLimiter:
-    """Per-IP sliding-window limiter (in-memory; the app is single-process)."""
+    """Per-IP sliding-window limiter (in-memory; the app is single-process).
 
-    def __init__(self, limit: int = RATE_LIMIT, window: float = RATE_WINDOW_S) -> None:
+    The bucket map is bounded (SPEC.md §5): every call first prunes IPs whose last
+    hit fell outside the window, and a hard cap evicts the oldest IPs if the map
+    still overflows — so a flood of distinct source IPs cannot grow it forever."""
+
+    def __init__(
+        self, limit: int = RATE_LIMIT, window: float = RATE_WINDOW_S, max_ips: int = RATE_MAX_IPS
+    ) -> None:
         self._limit = limit
         self._window = window
+        self._max_ips = max_ips
         self._hits: dict[str, deque[float]] = {}
 
     def allow(self, ip: str) -> bool:
         now = time.monotonic()
+        self._prune(now)
         bucket = self._hits.setdefault(ip, deque())
         while bucket and now - bucket[0] > self._window:
             bucket.popleft()
@@ -83,6 +95,18 @@ class RateLimiter:
             return False
         bucket.append(now)
         return True
+
+    def _prune(self, now: float) -> None:
+        """Drop buckets with no hit inside the window; hard-cap tracked IPs."""
+        stale = [ip for ip, b in self._hits.items() if not b or now - b[-1] > self._window]
+        for ip in stale:
+            del self._hits[ip]
+        overflow = len(self._hits) - self._max_ips
+        if overflow > 0:
+            # Evict the IPs whose most recent hit is oldest, until under the cap.
+            oldest = sorted(self._hits, key=lambda k: self._hits[k][-1])[:overflow]
+            for ip in oldest:
+                del self._hits[ip]
 
 
 def client_ip(request: Request) -> str:
@@ -155,7 +179,7 @@ async def post_index(request: Request, tree: MailboxTree, limiter: RateLimiter) 
 
     return _page(
         error="",
-        content=_folder_section(folders, secret),
+        content=_folder_section(folders),
         script=_COPY_SCRIPT,
         show_all=show_all,
     )
@@ -192,22 +216,22 @@ def _page(
     return HTMLResponse(html, status_code=status, headers=dict(_PAGE_HEADERS))
 
 
-def _folder_section(folders, secret: str) -> str:
+def _folder_section(folders) -> str:
     if not folders:
         return "<p>No folders to show.</p>"
     rows = [_folder_row(mailbox, path) for mailbox, path in folders]
-    # OPML download: the secret is reflected into a hidden field so the download is
-    # one click. The page is Cache-Control: no-store and the value is the user's own
-    # just-typed secret — never logged, never a cookie/session (SPEC.md §4.4).
-    opml_form = (
-        '<form method="post" action="/?format=opml">'
-        f'<input type="hidden" name="secret" value="{escape(secret, quote=True)}">'
-        '<input type="hidden" name="format" value="opml">'
-        "<button type=\"submit\">Download OPML (all listed folders)</button></form>"
+    # OPML download as an INLINE data: link (SPEC.md §4.4): the OPML is generated
+    # here on the first POST and offered as a base64 data URI, so the secret never
+    # round-trips a second time and never sits in a hidden form field. A top-level
+    # <a download> navigation is not blocked by the page CSP (default-src 'none').
+    opml_b64 = base64.b64encode(build_opml(folders).encode("utf-8")).decode("ascii")
+    opml_link = (
+        f'<p><a download="mail2rss.opml" href="data:text/x-opml;base64,{opml_b64}">'
+        "Download OPML (all listed folders)</a></p>"
     )
     return (
         f"<p>{len(folders)} folder(s). Feed defaults: 20 entries.</p>"
-        + opml_form
+        + opml_link
         + '<ul class="folders">'
         + "".join(rows)
         + "</ul>"

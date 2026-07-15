@@ -107,6 +107,72 @@ def test_strip_xml_incompatible_keeps_tab_lf_cr():
     assert strip_xml_incompatible("a\x00b\x0cc") == "abc"
 
 
+def test_strip_removes_fffe_ffff_noncharacters():
+    # The XML-1.0-forbidden non-characters — the exact chars that used to 500 the
+    # whole feed (SPEC.md §7.5 step 14, F17).
+    assert strip_xml_incompatible("a￾b￿c") == "abc"
+
+
+def test_noncharacters_fffe_ffff_do_not_500_the_feed():
+    # A subject + body carrying U+FFFE / U+FFFF (and \x0c) must NOT raise: lxml
+    # rejects these, and build_atom serialises every entry at once, so one bad char
+    # would 500 the whole feed. All entries must survive (SPEC.md §7.5 step 14).
+    entries = []
+    for i in range(3):
+        entries.append(
+            FeedEntry(
+                id=f"urn:uuid:{uuid.uuid5(NS_MAIL2RSS, f'nc{i}')}",
+                title=f"Sub￾ject {i} end￿",
+                link=f"https://p/e{i}.html",
+                author_name="Na￾me",
+                author_email="a@b.c",
+                published=datetime(2026, 7, 1, 12, i, tzinfo=timezone.utc),
+                updated=datetime(2026, 7, 1, 12, i, tzinfo=timezone.utc),
+                categories=("c￿at",),
+                content_html=f"<p>Body {i} ￾ and ￿ and \x0c here</p>",
+            )
+        )
+    data = build_atom(
+        feed_id="urn:uuid:feed",
+        title="T￿itle",
+        self_url="https://s/atom.xml",
+        entries=entries,
+    )
+    root = etree.fromstring(data)  # must parse — no ValueError, no 500
+    assert len(root.findall(f"{_ATOM}entry")) == 3
+    assert "￾".encode("utf-8") not in data
+    assert "￿".encode("utf-8") not in data
+
+
+def test_build_atom_failsafe_when_strip_is_bypassed(monkeypatch):
+    # Belt-and-braces: even if strip_xml_incompatible ever missed a char, build_atom
+    # must not 500 — it re-hardens every string and still returns valid XML (F17).
+    import src.feed as feed_mod
+
+    monkeypatch.setattr(feed_mod, "strip_xml_incompatible", lambda s: s)
+    entries = [
+        FeedEntry(
+            id=f"urn:uuid:{uuid.uuid5(NS_MAIL2RSS, f'bb{i}')}",
+            title=f"Title {i}\x0c",
+            link=f"https://p/e{i}.html",
+            author_name=None,
+            author_email=None,
+            published=datetime(2026, 7, 1, 12, i, tzinfo=timezone.utc),
+            updated=datetime(2026, 7, 1, 12, i, tzinfo=timezone.utc),
+            categories=(),
+            content_html=f"<p>Body {i}\x0c\x00 here</p>",
+        )
+        for i in range(2)
+    ]
+    data = build_atom(
+        feed_id="urn:uuid:feed", title="Feed\x0c", self_url="https://s/atom.xml", entries=entries
+    )
+    root = etree.fromstring(data)  # no ValueError propagated out of build_atom
+    assert len(root.findall(f"{_ATOM}entry")) == 2  # entries re-stripped, not dropped
+    assert b"\x0c" not in data
+    assert b"\x00" not in data
+
+
 # --------------------------------------------------------------------------- #
 # entry_id stability (SPEC.md §7.2, F11)
 # --------------------------------------------------------------------------- #

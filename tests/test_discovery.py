@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import base64
+import re
+
 import httpx
 import pytest
 import respx
@@ -153,3 +156,57 @@ def test_rate_limited_after_five_attempts():
             statuses.append(client.post("/", data={"secret": "nope"}).status_code)
     assert statuses[:5] == [401] * 5
     assert statuses[5] == 429
+
+
+# --------------------------------------------------------------------------- #
+# FIX 5: the rate-limiter's bucket map must stay bounded (SPEC.md §5)
+# --------------------------------------------------------------------------- #
+
+
+def test_rate_limiter_prunes_stale_ips(monkeypatch):
+    import src.discovery as disc
+
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(disc.time, "monotonic", lambda: clock["t"])
+    rl = disc.RateLimiter(limit=5, window=60.0)
+    for i in range(50):
+        assert rl.allow(f"10.0.0.{i}")
+    assert len(rl._hits) == 50
+    clock["t"] += 120.0  # advance well past the window
+    rl.allow("10.9.9.9")
+    assert len(rl._hits) == 1  # all 50 stale buckets pruned, only the fresh IP remains
+
+
+def test_rate_limiter_caps_tracked_ips(monkeypatch):
+    import src.discovery as disc
+
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(disc.time, "monotonic", lambda: clock["t"])
+    rl = disc.RateLimiter(limit=5, window=60.0, max_ips=100)
+    for i in range(300):  # 300 distinct IPs, all within the (frozen) window
+        rl.allow(f"10.{i // 256}.{i % 256}.1")
+    assert len(rl._hits) <= 101  # the hard cap keeps the map bounded
+
+
+# --------------------------------------------------------------------------- #
+# FIX 8: the OPML download must be an inline data: link, not a reflected secret
+# --------------------------------------------------------------------------- #
+
+
+@respx.mock
+def test_opml_download_is_data_link_not_reflected_secret():
+    _mock_jmap()
+    with TestClient(app) as client:
+        r = client.post("/", data={"secret": TEST_SECRET})
+    assert r.status_code == 200
+    body = r.text
+    # the secret never round-trips into a hidden field or anywhere on the page
+    assert 'type="hidden" name="secret"' not in body
+    assert TEST_SECRET not in body
+    # OPML is offered as an inline data: download link carrying the feed URLs
+    assert 'href="data:text/x-opml;base64,' in body
+    m = re.search(r'href="data:text/x-opml;base64,([A-Za-z0-9+/=]+)"', body)
+    assert m is not None
+    decoded = base64.b64decode(m.group(1)).decode("utf-8")
+    assert "<opml" in decoded
+    assert "atom.xml" in decoded

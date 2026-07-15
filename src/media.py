@@ -76,8 +76,11 @@ class MediaProxy:
         self._cache = cache
         self._jmap = jmap
         # In-flight dedup: one lock per blob so two concurrent requests for the
-        # same blob do not both hit Fastmail (SPEC.md §14.1).
+        # same blob do not both hit Fastmail (SPEC.md §14.1). The map is bounded —
+        # a lock is reference-counted and removed once the last holder is done, so
+        # it does not grow with every distinct blob ever seen (SPEC.md §5).
         self._locks: dict[str, asyncio.Lock] = {}
+        self._lock_refs: dict[str, int] = {}
         self._locks_guard = asyncio.Lock()
 
     async def handle(
@@ -140,38 +143,57 @@ class MediaProxy:
 
     # --- Fetch + cache -------------------------------------------------------
 
-    async def _lock_for(self, blob_id: str) -> asyncio.Lock:
+    async def _acquire_lock(self, blob_id: str) -> asyncio.Lock:
+        """Get (or create) the blob's lock and bump its ref count. The count is
+        raised BEFORE the caller awaits the lock, so a concurrent waiter keeps the
+        entry alive and shares the SAME lock — the dedup contract is preserved."""
         async with self._locks_guard:
             lock = self._locks.get(blob_id)
             if lock is None:
                 lock = asyncio.Lock()
                 self._locks[blob_id] = lock
+                self._lock_refs[blob_id] = 0
+            self._lock_refs[blob_id] += 1
             return lock
+
+    async def _release_lock(self, blob_id: str) -> None:
+        """Drop this holder's ref; remove the lock once nobody else holds it, so
+        the map stays bounded (SPEC.md §5)."""
+        async with self._locks_guard:
+            remaining = self._lock_refs.get(blob_id, 0) - 1
+            if remaining <= 0:
+                self._locks.pop(blob_id, None)
+                self._lock_refs.pop(blob_id, None)
+            else:
+                self._lock_refs[blob_id] = remaining
 
     async def _fetch_and_cache(
         self, blob_id: str, name: str, declared: str
     ) -> MediaRecord | None:
-        lock = await self._lock_for(blob_id)
-        async with lock:
-            # Re-check under the lock: a concurrent request may have just filled it.
-            record = await self._cache.get_media(blob_id)
-            if record is not None:
+        lock = await self._acquire_lock(blob_id)
+        try:
+            async with lock:
+                # Re-check under the lock: a concurrent request may have just filled it.
+                record = await self._cache.get_media(blob_id)
+                if record is not None:
+                    return record
+                try:
+                    data = await self._download(blob_id, name, declared)
+                except JmapNotFound:
+                    logger.info(f"media_blob_not_found: blob {blob_id}")
+                    return None
+                except _MediaTooLarge:
+                    logger.warning(f"media_blob_too_large: blob {blob_id}, cap {MAX_MEDIA_BYTES}")
+                    return None
+                except (JmapError, asyncio.TimeoutError) as exc:
+                    logger.warning(f"media_download_failed: blob {blob_id}, error {exc!r}")
+                    return None
+                content_type = declared or "application/octet-stream"
+                record = await self._cache.put_media(blob_id, data, content_type)
+                logger.info(f"media_cached: blob {blob_id}, bytes {len(data)}")
                 return record
-            try:
-                data = await self._download(blob_id, name, declared)
-            except JmapNotFound:
-                logger.info(f"media_blob_not_found: blob {blob_id}")
-                return None
-            except _MediaTooLarge:
-                logger.warning(f"media_blob_too_large: blob {blob_id}, cap {MAX_MEDIA_BYTES}")
-                return None
-            except (JmapError, asyncio.TimeoutError) as exc:
-                logger.warning(f"media_download_failed: blob {blob_id}, error {exc!r}")
-                return None
-            content_type = declared or "application/octet-stream"
-            record = await self._cache.put_media(blob_id, data, content_type)
-            logger.info(f"media_cached: blob {blob_id}, bytes {len(data)}")
-            return record
+        finally:
+            await self._release_lock(blob_id)
 
     async def _download(self, blob_id: str, name: str, declared: str) -> bytes:
         """Stream the blob with a hard size cap and timeout (SPEC.md §8.1 p.7)."""

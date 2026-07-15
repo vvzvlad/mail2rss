@@ -326,3 +326,156 @@ def test_mac_never_appears_in_logs():
     joined = "".join(captured)
     assert mac not in joined  # the capability token is never logged (SPEC.md §5.2 p.5)
     assert "mac_hash" in joined  # only a 6-char hash of it is
+
+
+# --------------------------------------------------------------------------- #
+# FIX 1: a message with U+FFFE/U+FFFF must not 500 the feed (SPEC.md §7.5 step 14)
+# --------------------------------------------------------------------------- #
+
+
+@respx.mock
+def test_feed_with_noncharacters_returns_200_not_500():
+    bad = dict(
+        EMAIL_1,
+        id="Ebad",
+        subject="Weekly ￿ digest ￾ end",
+        bodyValues={"1": {"value": "<p>Hello ￿ world ￾ \x0c</p>", "isTruncated": False}},
+    )
+    _mock_jmap(emails=[bad])
+    with TestClient(app) as client:
+        r = client.get(_feed_path())
+    assert r.status_code == 200  # not a 500 from lxml's XML-compat ValueError
+    root = etree.fromstring(r.content)
+    assert root.find(f"{_ATOM}entry") is not None
+
+
+# --------------------------------------------------------------------------- #
+# FIX 2: atom:id fallback must not depend on the JMAP Email.id (SPEC.md §7.2)
+# --------------------------------------------------------------------------- #
+
+
+def test_fallback_atom_id_independent_of_email_id():
+    from fixtures.sample_emails import make_email
+
+    from src.app import _fallback_seed, _render_feed_body
+    from src.feed import entry_id
+
+    e1 = make_email(id="E1", message_id=None)
+    e2 = make_email(id="E2-COMPLETELY-DIFFERENT", message_id=None)  # same content, diff id
+    # The fallback seed is built from stable content fields only, never Email.id.
+    assert _fallback_seed(e1) == _fallback_seed(e2)
+    assert entry_id(None, _fallback_seed(e1)) == entry_id(None, _fallback_seed(e2))
+
+    mac = feed_mac("M1", FeedParams(), settings.epoch_for("M1"))
+
+    def _atom_id(email):
+        body, _ = _render_feed_body(
+            emails=[email], mailbox_id="M1", mac=mac, signed_params=FeedParams(), title="Tech"
+        )
+        return etree.fromstring(body).find(f"{_ATOM}entry/{_ATOM}id").text
+
+    # same content, different Email.id -> SAME atom:id (proves independence)
+    assert _atom_id(e1) == _atom_id(e2)
+    # different content -> different atom:id
+    e3 = make_email(id="E1", message_id=None, subject="A totally different subject")
+    assert _atom_id(e3) != _atom_id(e1)
+
+
+# --------------------------------------------------------------------------- #
+# FIX 3: the error feed's dates must be deterministic (SPEC.md §7.3/§14.2)
+# --------------------------------------------------------------------------- #
+
+
+def test_error_feed_body_is_byte_stable_across_calls():
+    from src.app import _build_error_feed
+
+    mac = feed_mac("M1", FeedParams(), settings.epoch_for("M1"))
+    a = _build_error_feed("M1", mac, "tech", FeedParams())
+    b = _build_error_feed("M1", mac, "tech", FeedParams())
+    assert a == b  # deterministic date -> body/ETag/<updated> never jitter
+
+
+# --------------------------------------------------------------------------- #
+# FIX 4: the render/serialise path must never 500 the feed route (SPEC.md §6.4)
+# --------------------------------------------------------------------------- #
+
+
+@respx.mock
+def test_render_failure_serves_stale_when_cache_warm(monkeypatch):
+    import src.app as app_mod
+
+    _mock_jmap()
+    monkeypatch.setattr(settings, "cache_ttl", 0)  # force a re-render every request
+    with TestClient(app) as client:
+        r1 = client.get(_feed_path())
+        assert r1.status_code == 200
+
+        def boom(**_kw):
+            raise RuntimeError("render exploded")
+
+        monkeypatch.setattr(app_mod, "_render_feed_body", boom)
+        r2 = client.get(_feed_path())
+    assert r2.status_code == 200  # stale served, never a 500
+    assert r2.headers["X-Upstream-Status"] == "stale"
+    assert b"<entry" in r2.content  # never an empty-but-valid feed
+
+
+@respx.mock
+def test_render_failure_cold_returns_503_not_500(monkeypatch):
+    import src.app as app_mod
+
+    _mock_jmap()
+
+    def boom(**_kw):
+        raise RuntimeError("render exploded")
+
+    monkeypatch.setattr(app_mod, "_render_feed_body", boom)
+    with TestClient(app) as client:
+        r = client.get(_feed_path())
+    assert r.status_code == 503  # no cache to fall back to -> 503, never 500
+    assert r.headers["Retry-After"] == "300"
+    assert b"<entry" not in r.content
+
+
+# --------------------------------------------------------------------------- #
+# FIX 9: a stale/kv-restored tree must not persist a false "folder deleted"
+# --------------------------------------------------------------------------- #
+
+
+@respx.mock
+def test_stale_tree_missing_folder_forces_refresh_and_serves_entries():
+    from src.mailbox_tree import _KV_KEY, _dump
+    from src.models import Mailbox
+
+    # Mailbox/get fails on the FIRST call (cold: the tree loads a stale snapshot
+    # from kv that lacks M1), then succeeds WITH M1 on the forced refresh.
+    respx.get(SESSION_URL).mock(return_value=httpx.Response(200, json=SESSION_JSON))
+    calls = {"mailbox_get": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        responses = []
+        for name, args, cid in body["methodCalls"]:
+            if name == "Mailbox/get":
+                calls["mailbox_get"] += 1
+                if calls["mailbox_get"] == 1:
+                    return httpx.Response(500, text="down")
+                responses.append(["Mailbox/get", {"accountId": ACCOUNT_ID, "list": [MAILBOX_M1]}, cid])
+            elif name == "Email/query":
+                responses.append(["Email/query", {"accountId": ACCOUNT_ID, "ids": ["E1"]}, cid])
+            elif name == "Email/get":
+                responses.append(["Email/get", {"accountId": ACCOUNT_ID, "list": [EMAIL_1], "notFound": []}, cid])
+        return httpx.Response(200, json={"methodResponses": responses})
+
+    respx.post(API_URL).mock(side_effect=handler)
+
+    with TestClient(app) as client:
+        # Pre-seed kv with a STALE tree lacking M1 -> the cold load returns it.
+        stale = _dump([Mailbox(id="OTHER", name="Other", parent_id=None, role=None, total_emails=0)])
+        app.state.cache.kv_put_sync(_KV_KEY, stale)
+        r = client.get(_feed_path())
+    assert r.status_code == 200
+    root = etree.fromstring(r.content)
+    title = root.find(f"{_ATOM}entry/{_ATOM}title").text
+    # A forced refresh found M1 -> real entries, NOT the "folder deleted" feed.
+    assert title == "Weekly digest"

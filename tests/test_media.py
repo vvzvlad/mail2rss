@@ -171,3 +171,50 @@ def test_media_served_from_cache_on_second_request():
         client.get(_media_path(ct="image/png"))
     # Second request is a cache hit: Fastmail is fetched only once.
     assert route.call_count == 1
+
+
+# --------------------------------------------------------------------------- #
+# FIX 5: the in-flight lock map must stay bounded (SPEC.md §5)
+# --------------------------------------------------------------------------- #
+
+
+@respx.mock
+def test_media_locks_map_bounded_after_distinct_blobs():
+    _mock_session()
+    _mock_download(b"PNGDATA")
+    with TestClient(app) as client:
+        proxy = app.state.media
+        for i in range(6):
+            r = client.get(_media_path(blob_id=f"Bdistinct{i}", ct="image/png"))
+            assert r.status_code == 200
+        # Each download completed -> no lock entry lingers for any blob.
+        assert len(proxy._locks) == 0
+        assert len(proxy._lock_refs) == 0
+
+
+# --------------------------------------------------------------------------- #
+# FIX 6: the media sig and mac must never reach the logs (SPEC.md §5.2 p.5)
+# --------------------------------------------------------------------------- #
+
+
+@respx.mock
+def test_media_sig_and_mac_absent_from_logs():
+    from loguru import logger
+
+    _mock_session()
+    _mock_download(b"PNGDATA")
+    path = _media_path(blob_id="BsecretBlob", ct="image/png")
+    parts = path.split("/")
+    mac = parts[4]
+    sig = parts[7]
+    captured: list[str] = []
+    sink_id = logger.add(captured.append, level="DEBUG")
+    try:
+        with TestClient(app) as client:
+            client.get(path)
+    finally:
+        logger.remove(sink_id)
+    joined = "".join(captured)
+    assert mac not in joined  # capability token never logged
+    assert sig not in joined  # the media sig is scrubbed the same way as the mac
+    assert "sig#" in joined  # only a short hash of the sig appears in the request log

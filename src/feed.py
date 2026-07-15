@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Sequence
 
+from loguru import logger
 from lxml import etree
 
 ATOM_NS = "http://www.w3.org/2005/Atom"
@@ -32,9 +33,21 @@ _A = f"{{{ATOM_NS}}}"
 # as unread in every reader (F11).
 NS_MAIL2RSS: uuid.UUID = uuid.UUID("71c87a5c-0436-4213-9233-f2620401eec7")
 
-# XML 1.0 forbids these control characters (tab/LF/CR are allowed and kept). Lone
-# surrogates are stripped too — lxml rejects them (SPEC.md §7.5 step 14, F17).
-_XML_INCOMPATIBLE = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f\ud800-\udfff]")
+# XML 1.0 forbids these characters (tab/LF/CR are allowed and kept). Stripped:
+# the C0 controls, lone surrogates, and the non-characters U+FFFE/U+FFFF — lxml
+# raises the same ValueError on all of them. The non-characters are easy to miss
+# (a naive "controls + surrogates" regex omits them) yet reachable via a broken
+# decode / mishandled UTF-16 BOM (SPEC.md §7.5 step 14, F17).
+_XML_INCOMPATIBLE = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f\ud800-\udfff￾￿]")
+
+# Fallback: the FULL complement of the XML 1.0 Char production. Used only by the
+# belt-and-braces path in build_atom to harden any string that somehow still
+# carried an XML-incompatible char past strip_xml_incompatible (SPEC.md §7.5 step
+# 14). Independent of strip_xml_incompatible on purpose, so it still cleans input
+# even if that function is ever wrong.
+_XML_INVALID_ANY = re.compile(
+    "[^\x09\x0a\x0d\x20-퟿-�\U00010000-\U0010ffff]"
+)
 
 # Deterministic feed-level <updated> when a feed happens to have no entries.
 _EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
@@ -90,7 +103,24 @@ def build_atom(
     self_url: str,
     entries: Sequence[FeedEntry],
 ) -> bytes:
-    """Serialise a full Atom 1.0 document to deterministic UTF-8 bytes."""
+    """Serialise a full Atom 1.0 document to deterministic UTF-8 bytes.
+
+    Belt-and-braces (SPEC.md §7.5 step 14, F17): a feed must NEVER 500 because of
+    message content. If any string still carries an XML-incompatible char that
+    slipped past ``strip_xml_incompatible`` (lxml raises ``ValueError`` when such a
+    char is assigned), we re-strip every string with the full XML-1.0 complement
+    and drop any entry that STILL refuses to serialise, then produce a valid
+    document. Deterministic given the same input, so the ETag stays stable.
+    """
+    try:
+        return _serialise_feed(feed_id, title, self_url, entries)
+    except ValueError:
+        return _serialise_feed_hardened(feed_id, title, self_url, entries)
+
+
+def _serialise_feed(
+    feed_id: str, title: str, self_url: str, entries: Sequence[FeedEntry]
+) -> bytes:
     feed = etree.Element(_A + "feed", nsmap={None: ATOM_NS})
     _text_child(feed, "title", title)
     _text_child(feed, "id", feed_id)
@@ -111,6 +141,59 @@ def build_atom(
     )
 
 
+def _serialise_feed_hardened(
+    feed_id: str, title: str, self_url: str, entries: Sequence[FeedEntry]
+) -> bytes:
+    """Re-strip every string hard, drop any entry that still won't serialise, and
+    build a valid document — the last-resort fail-safe for build_atom (F17)."""
+    safe_entries: list[FeedEntry] = []
+    for entry in entries:
+        hardened = _harden_entry(entry)
+        if _entry_serialisable(hardened):
+            safe_entries.append(hardened)
+        else:
+            # Never 500 the whole feed for one poisoned entry. The id is a
+            # urn:uuid (not a secret), so it is safe to log.
+            logger.warning(f"feed_entry_dropped_xml_incompatible: id {hardened.id}")
+    return _serialise_feed(
+        _force_xml_safe(feed_id),
+        _force_xml_safe(title),
+        _force_xml_safe(self_url),
+        safe_entries,
+    )
+
+
+def _force_xml_safe(s: str) -> str:
+    """Remove every char outside the XML 1.0 Char production (belt-and-braces)."""
+    if not s:
+        return s
+    return _XML_INVALID_ANY.sub("", s)
+
+
+def _harden_entry(entry: FeedEntry) -> FeedEntry:
+    return FeedEntry(
+        id=_force_xml_safe(entry.id),
+        title=_force_xml_safe(entry.title),
+        link=_force_xml_safe(entry.link),
+        author_name=_force_xml_safe(entry.author_name) if entry.author_name else entry.author_name,
+        author_email=_force_xml_safe(entry.author_email) if entry.author_email else entry.author_email,
+        published=entry.published,
+        updated=entry.updated,
+        categories=tuple(_force_xml_safe(c) for c in entry.categories),
+        content_html=_force_xml_safe(entry.content_html),
+    )
+
+
+def _entry_serialisable(entry: FeedEntry) -> bool:
+    try:
+        probe = etree.Element(_A + "feed", nsmap={None: ATOM_NS})
+        _entry_element(probe, entry)
+        etree.tostring(probe)
+        return True
+    except ValueError:
+        return False
+
+
 def error_feed(
     *,
     feed_id: str,
@@ -124,6 +207,8 @@ def error_feed(
 
     ``entry_id_`` must be STABLE (the caller passes ``uuid5(ns, "error:" +
     mailbox_id)``) — otherwise the error entry resurfaces as unread on every poll.
+    The final serialisation goes through ``build_atom``, so its F17 fail-safe
+    (SPEC.md §7.5 step 14) covers this feed too: it can never 500 on content.
     """
     entry = FeedEntry(
         id=entry_id_,

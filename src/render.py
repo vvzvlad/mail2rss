@@ -553,8 +553,11 @@ def truncate_html(html: str, limit_bytes: int, permalink: str) -> str:
         return html
     try:
         container = lxml.html.fragment_fromstring(html, create_parent="body")
-    except Exception:  # noqa: BLE001 - malformed input still gets a valid tail
-        return read_more
+    except Exception:  # noqa: BLE001 - reparse failed: keep the whole body, never drop it
+        # The input is already sanitised and safe; returning only the tail would
+        # silently lose the entire message. Return the original body plus the
+        # "read full email" tail instead (SPEC.md §7.5.1: no silent content loss).
+        return html + read_more
 
     kept: list[str] = []
     total = 0

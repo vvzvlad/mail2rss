@@ -245,3 +245,20 @@ def test_truncate_cuts_on_block_boundary_and_stays_xml():
 def test_truncate_noop_when_within_limit():
     html = "<p>short</p>"
     assert truncate_html(html, 10_000, "https://p/e.html") == html
+
+
+def test_truncate_reparse_failure_keeps_full_body(monkeypatch):
+    # If the internal reparse raises, the whole (already-sanitised) body must be
+    # kept, not silently replaced by only the "read full email" link (SPEC.md
+    # §7.5.1: no silent content loss).
+    import src.render as render_mod
+
+    body = "<p>" + "unique-body-content " * 3000 + "</p>"  # well over the limit
+
+    def boom(*_a, **_k):
+        raise ValueError("reparse failed")
+
+    monkeypatch.setattr(render_mod.lxml.html, "fragment_fromstring", boom)
+    out = truncate_html(body, 100, "https://p/e.html")
+    assert "unique-body-content" in out  # original content preserved, not just the link
+    assert "Читать письмо целиком" in out
