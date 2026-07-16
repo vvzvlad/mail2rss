@@ -5,20 +5,19 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="referrer" content="no-referrer">
 <meta name="robots" content="noindex, nofollow, noarchive">
-<title>mail2rss — feed links</title>
+<title>mail2rss — link calculator</title>
 <style>
   :root { color-scheme: light dark; }
   body { max-width: 52rem; margin: 2rem auto; padding: 0 1rem;
          font-family: system-ui, -apple-system, sans-serif; line-height: 1.5; }
   h1 { font-size: 1.4rem; }
-  form.auth { margin: 1rem 0; padding: 1rem; border: 1px solid #8884; border-radius: 8px; }
-  label { display: block; margin: 0.4rem 0; }
-  input[type=password] { width: 100%; max-width: 24rem; padding: 0.4rem; box-sizing: border-box; }
+  form.calc { margin: 1rem 0; padding: 1rem; border: 1px solid #8884; border-radius: 8px; }
+  label { display: block; margin: 0.6rem 0; }
+  input[type=password], input[type=text] { width: 100%; max-width: 24rem; padding: 0.4rem;
+         box-sizing: border-box; display: block; }
+  input[type=number] { width: 6rem; padding: 0.4rem; box-sizing: border-box; display: block; }
   button { padding: 0.4rem 0.8rem; cursor: pointer; }
-  ul.folders { list-style: none; padding: 0; }
-  li.folder { margin: 0.6rem 0; padding: 0.6rem; border: 1px solid #8884; border-radius: 6px; }
-  .path { font-weight: 600; }
-  .count { color: #8889; font-size: 0.85rem; }
+  code { font-family: ui-monospace, monospace; font-size: 0.9em; }
   .url { font-family: ui-monospace, monospace; font-size: 0.8rem; width: 100%;
          box-sizing: border-box; padding: 0.3rem; margin: 0.2rem 0; }
   .error { padding: 0.6rem 0.8rem; border-radius: 6px; background: #f882;
@@ -32,18 +31,203 @@
 </head>
 <body>
 <main>
-<h1>mail2rss</h1>
-<p class="muted">Paste your secret to list your Fastmail folders and copy ready-made Atom feed URLs for Miniflux. Nothing is stored; the secret is used only to compute this page.</p>
-${error}
-<form class="auth" method="post" action="/" autocomplete="off">
+<h1>mail2rss — link calculator</h1>
+<p class="muted">Everything on this page is computed in your browser (WebCrypto): the secret
+and the mailbox id are never sent anywhere. Get mailbox ids from the CLI with
+<code>mail2rss folders</code>; an OPML with all folders comes from <code>mail2rss opml</code>.</p>
+
+<div id="unsupported" class="error" hidden>
+  The calculator cannot run: WebCrypto is unavailable or its self-test failed.
+  WebCrypto requires a secure context — open this page over HTTPS (or on localhost).
+</div>
+
+<!-- No method/action on purpose: the submit handler computes the URL locally and
+     calls preventDefault(), and the button stays disabled until the WebCrypto
+     self-test passes — nothing can ever be submitted to the server. -->
+<form id="calc" class="calc" autocomplete="off">
   <label>Secret
-    <input type="password" name="secret" autocomplete="off" spellcheck="false" autocapitalize="none" required>
+    <input type="password" id="secret" autocomplete="off" spellcheck="false"
+           autocapitalize="none" required>
   </label>
-  <label><input type="checkbox" name="show_all" value="1" ${show_all_checked}> show system folders (Inbox, Archive, …)</label>
-  <button type="submit">List folders</button>
+  <label>Mailbox id <span class="muted">(from <code>mail2rss folders</code>)</span>
+    <input type="text" id="mailbox" autocomplete="off" spellcheck="false"
+           autocapitalize="none" placeholder="M9f3ac21b" required>
+  </label>
+  <label>Folder name <span class="muted">(optional — only prettifies the URL)</span>
+    <input type="text" id="folder-name" autocomplete="off" spellcheck="false">
+  </label>
+  <label>Entries limit
+    <input type="number" id="limit" value="20" min="1" max="100">
+  </label>
+  <label><input type="checkbox" id="children"> include subfolders</label>
+  <label>Epoch <span class="muted">(advanced — leave empty unless you bumped
+    <code>MAIL2RSS_EPOCH</code> for this folder)</span>
+    <input type="text" id="epoch" autocomplete="off" spellcheck="false">
+  </label>
+  <button type="submit" id="compute" disabled>Compute link</button>
 </form>
-${content}
+
+<div id="calc-error" class="error" hidden></div>
+
+<div id="result" hidden>
+  <input class="url" id="result-url" readonly>
+  <button type="button" class="copy" id="copy">copy</button>
+</div>
 </main>
-${script}
+<script>
+'use strict';
+
+// Server-embedded URL prefix; strip trailing slashes just in case, mirroring
+// the rstrip("/") in src/crypto.py feed_url(). NOTE: no JS template literals
+// anywhere in this file — ${...} is the server-side placeholder syntax.
+var BASE_URL = '${base_url}'.replace(/\/+$/, '');
+
+var te = new TextEncoder();
+
+// Self-test vector: keep these constants together in this one literal —
+// tests/test_discovery.py regex-extracts them and recomputes the mac with the
+// Python implementation, pinning both sides to the same bytes.
+var SELFTEST = {
+  secret: 'mfrggzdfmztwq2lknnwg23tpob',
+  mailbox: 'M1',
+  canon: '',
+  epoch: '',
+  mac: 'd34dalcqvvpkmmt5sh5quolv6w'
+};
+
+// RFC 4648 base32, lowercase, unpadded (mirrors src/crypto.py _b32).
+function b32(buf) {
+  var A = 'abcdefghijklmnopqrstuvwxyz234567';
+  var bytes = new Uint8Array(buf);
+  var bits = 0, val = 0, out = '';
+  for (var i = 0; i < bytes.length; i++) {
+    val = (val << 8) | bytes[i]; bits += 8;
+    while (bits >= 5) { out += A[(val >>> (bits - 5)) & 31]; bits -= 5; }
+  }
+  if (bits > 0) out += A[(val << (5 - bits)) & 31];
+  return out;
+}
+
+// K_feed = HKDF-SHA256(secret, salt = 32 zero bytes, info = "mail2rss/feed-mac/v1")
+// mac    = base32(HMAC-SHA256(K_feed, mailboxId || 0x00 || canon || 0x00 || epoch))[:26]
+// Byte-for-byte identical to feed_mac() in src/crypto.py.
+async function feedMac(secret, mailboxId, canon, epoch) {
+  var ikm = await crypto.subtle.importKey('raw', te.encode(secret), 'HKDF', false, ['deriveBits']);
+  // The salt MUST be an explicit 32-zero-byte array to match the Python HKDF
+  // (hmac.new(b"\x00" * 32, ikm, sha256) as the RFC 5869 extract step).
+  var kFeed = await crypto.subtle.deriveBits(
+    { name: 'HKDF', hash: 'SHA-256', salt: new Uint8Array(32), info: te.encode('mail2rss/feed-mac/v1') },
+    ikm, 256);
+  var key = await crypto.subtle.importKey('raw', kFeed, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  var mb = te.encode(mailboxId), cp = te.encode(canon), ep = te.encode(epoch);
+  var msg = new Uint8Array(mb.length + 1 + cp.length + 1 + ep.length);
+  msg.set(mb, 0);
+  msg.set(cp, mb.length + 1);
+  msg.set(ep, mb.length + 1 + cp.length + 1);
+  return b32(await crypto.subtle.sign('HMAC', key, msg)).slice(0, 26);
+}
+
+// Mirrors src/crypto.py canon_params(): only non-default values, keys sorted,
+// joined with '&'. A default feed canonicalises to ''.
+function canonParams(children, limit) {
+  var parts = [];
+  if (children) parts.push('children=1');
+  if (limit !== 20) parts.push('limit=' + limit);
+  parts.sort();
+  return parts.join('&');
+}
+
+// Cosmetic slug, mirrors src/crypto.py slugify(). Never verified server-side.
+var TRANSLIT = {
+  'а': 'a', 'б': 'b', 'в': 'v', 'г': 'g', 'д': 'd', 'е': 'e', 'ё': 'e',
+  'ж': 'zh', 'з': 'z', 'и': 'i', 'й': 'i', 'к': 'k', 'л': 'l', 'м': 'm',
+  'н': 'n', 'о': 'o', 'п': 'p', 'р': 'r', 'с': 's', 'т': 't', 'у': 'u',
+  'ф': 'f', 'х': 'h', 'ц': 'c', 'ч': 'ch', 'ш': 'sh', 'щ': 'sch', 'ъ': '',
+  'ы': 'y', 'ь': '', 'э': 'e', 'ю': 'yu', 'я': 'ya'
+};
+
+function slugify(name) {
+  var lowered = '';
+  for (var ch of name.toLowerCase()) {
+    lowered += Object.prototype.hasOwnProperty.call(TRANSLIT, ch) ? TRANSLIT[ch] : ch;
+  }
+  var asciiOnly = lowered.normalize('NFKD').replace(/[^\x00-\x7F]/g, '');
+  var slug = asciiOnly.replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+  slug = slug.slice(0, 40).replace(/^-+|-+$/g, '');
+  return slug || 'feed';
+}
+
+var form = document.getElementById('calc');
+var errBox = document.getElementById('calc-error');
+var resultBox = document.getElementById('result');
+var resultUrl = document.getElementById('result-url');
+var copyBtn = document.getElementById('copy');
+
+function showError(message) {
+  errBox.textContent = message;
+  errBox.hidden = false;
+  resultBox.hidden = true;
+}
+
+form.addEventListener('submit', function (ev) {
+  ev.preventDefault(); // nothing is ever submitted to the server
+  errBox.hidden = true;
+
+  var secret = document.getElementById('secret').value.trim();
+  var mailboxId = document.getElementById('mailbox').value.trim();
+  var folderName = document.getElementById('folder-name').value;
+  var rawLimit = document.getElementById('limit').value;
+  var children = document.getElementById('children').checked;
+  var epoch = document.getElementById('epoch').value.trim();
+
+  if (!secret) { showError('Secret is required.'); return; }
+  if (!/^[A-Za-z0-9_-]+$/.test(mailboxId)) {
+    showError('Mailbox id must contain only letters, digits, "-" and "_" (a JMAP id, e.g. M9f3ac21b).');
+    return;
+  }
+  var limit = parseInt(rawLimit, 10);
+  if (isNaN(limit)) limit = 20;
+  limit = Math.min(100, Math.max(1, limit));
+
+  var canon = canonParams(children, limit);
+  feedMac(secret, mailboxId, canon, epoch).then(function (mac) {
+    // mailboxId goes into the path raw: the charset was validated above,
+    // matching feed_url() in src/crypto.py (no URL-encoding).
+    var url = BASE_URL + '/f/' + slugify(folderName) + '/' + mailboxId + '/' + mac + '/atom.xml';
+    if (canon) url += '?' + canon;
+    resultUrl.value = url;
+    resultBox.hidden = false;
+  }, function () {
+    showError('Could not compute the MAC (WebCrypto error).');
+  });
+});
+
+copyBtn.addEventListener('click', function () {
+  if (navigator.clipboard) navigator.clipboard.writeText(resultUrl.value);
+  var t = copyBtn.textContent;
+  copyBtn.textContent = 'copied';
+  setTimeout(function () { copyBtn.textContent = t; }, 1200);
+});
+
+// Startup self-test: the compute button stays disabled unless WebCrypto exists
+// (secure context only) and reproduces the known-good vector exactly.
+(function init() {
+  var warn = document.getElementById('unsupported');
+  var compute = document.getElementById('compute');
+  if (!window.crypto || !window.crypto.subtle) {
+    warn.hidden = false;
+    return;
+  }
+  feedMac(SELFTEST.secret, SELFTEST.mailbox, SELFTEST.canon, SELFTEST.epoch).then(function (mac) {
+    if (mac === SELFTEST.mac) {
+      compute.disabled = false;
+    } else {
+      warn.hidden = false;
+    }
+  }, function () {
+    warn.hidden = false;
+  });
+})();
+</script>
 </body>
 </html>

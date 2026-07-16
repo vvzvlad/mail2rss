@@ -1,34 +1,25 @@
-"""Tests for src/discovery.py — the secret -> links page (SPEC.md §4.4)."""
+"""Tests for src/discovery.py — the client-side link-calculator page (SPEC.md §4.4).
+
+The page is a static calculator: the browser computes the feed MAC via WebCrypto
+and the server neither receives the secret nor reveals any mailbox data. No JMAP
+mocks appear here on purpose — the page must never touch Fastmail.
+"""
 
 from __future__ import annotations
 
-import base64
+import hashlib
+import hmac
 import re
+from pathlib import Path
 
-import httpx
 import pytest
-import respx
-from loguru import logger
 from starlette.testclient import TestClient
 
 from src.app import app
+from src.crypto import _b32, _derive_keys
 from src.settings import settings
-from tests.conftest import TEST_SECRET
 
-SESSION_URL = "https://api.fastmail.com/jmap/session"
-API_URL = "https://api.fastmail.test/jmap/api/"
-ACCOUNT_ID = "u1"
-
-SESSION_JSON = {
-    "apiUrl": API_URL,
-    "downloadUrl": "https://download.fastmail.test/dl/{accountId}/{blobId}/{name}?type={type}",
-    "primaryAccounts": {"urn:ietf:params:jmap:mail": ACCOUNT_ID},
-}
-
-MAILBOXES = [
-    {"id": "M1", "name": "Tech", "parentId": None, "role": None, "totalEmails": 5},
-    {"id": "Minbox", "name": "Inbox", "parentId": None, "role": "inbox", "totalEmails": 9},
-]
+TEMPLATE_PATH = Path(__file__).resolve().parent.parent / "templates" / "discovery.html"
 
 
 @pytest.fixture(autouse=True)
@@ -36,177 +27,91 @@ def _isolated_cache(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "cache_db_path", str(tmp_path / "cache.db"))
 
 
-def _mock_jmap():
-    respx.get(SESSION_URL).mock(return_value=httpx.Response(200, json=SESSION_JSON))
-
-    def handler(request):
-        return httpx.Response(
-            200,
-            json={"methodResponses": [["Mailbox/get", {"accountId": ACCOUNT_ID, "list": MAILBOXES}, "m"]]},
-        )
-
-    respx.post(API_URL).mock(side_effect=handler)
-
-
 # --------------------------------------------------------------------------- #
-# POST-only: the secret must never be accepted from the query string
+# GET / — the static calculator page
 # --------------------------------------------------------------------------- #
 
 
-@respx.mock
-def test_get_with_secret_in_query_is_rejected():
+def test_get_index_serves_calculator_with_base_url():
     with TestClient(app) as client:
-        r = client.get(f"/?secret={TEST_SECRET}")
-    assert r.status_code == 200
-    # GET never lists folders: no folder rows, no feed URLs.
-    assert 'class="folder"' not in r.text
-    assert "atom.xml" not in r.text
-
-
-# --------------------------------------------------------------------------- #
-# Wrong secret: neutral error, secret never logged
-# --------------------------------------------------------------------------- #
-
-
-@respx.mock
-def test_wrong_secret_neutral_error_and_not_logged():
-    captured: list[str] = []
-    sink_id = logger.add(captured.append, level="DEBUG")
-    try:
-        with TestClient(app) as client:
-            r = client.post("/", data={"secret": "definitely-wrong-secret"})
-    finally:
-        logger.remove(sink_id)
-    assert r.status_code == 401
-    assert 'class="folder"' not in r.text
-    assert "Invalid secret" in r.text
-    joined = "".join(captured)
-    assert "definitely-wrong-secret" not in joined
-
-
-# --------------------------------------------------------------------------- #
-# Correct secret: folder list with URLs
-# --------------------------------------------------------------------------- #
-
-
-@respx.mock
-def test_correct_secret_lists_folders_with_urls():
-    _mock_jmap()
-    with TestClient(app) as client:
-        r = client.post("/", data={"secret": TEST_SECRET})
-    assert r.status_code == 200
-    assert "Tech" in r.text
-    assert "atom.xml" in r.text  # a ready feed URL is shown
-    # System folders hidden by default (SPEC.md §4.4 p.6): the inbox mailbox id
-    # (which would appear inside its feed URL) is absent.
-    assert "Minbox" not in r.text
-
-
-@respx.mock
-def test_show_all_reveals_system_folders():
-    _mock_jmap()
-    with TestClient(app) as client:
-        r = client.post("/", data={"secret": TEST_SECRET, "show_all": "1"})
-    assert r.status_code == 200
-    assert "Minbox" in r.text  # the inbox folder is now listed
-
-
-@respx.mock
-def test_correct_secret_not_logged():
-    _mock_jmap()
-    captured: list[str] = []
-    sink_id = logger.add(captured.append, level="DEBUG")
-    try:
-        with TestClient(app) as client:
-            client.post("/", data={"secret": TEST_SECRET})
-    finally:
-        logger.remove(sink_id)
-    assert TEST_SECRET not in "".join(captured)
-
-
-# --------------------------------------------------------------------------- #
-# OPML export
-# --------------------------------------------------------------------------- #
-
-
-@respx.mock
-def test_opml_export():
-    _mock_jmap()
-    with TestClient(app) as client:
-        r = client.post("/?format=opml", data={"secret": TEST_SECRET})
-    assert r.status_code == 200
-    assert r.headers["content-type"].startswith("text/x-opml")
-    assert "attachment" in r.headers["content-disposition"].lower()
-    assert "<opml" in r.text
-    assert "atom.xml" in r.text
-
-
-# --------------------------------------------------------------------------- #
-# Rate limit (SPEC.md §4.4 p.3)
-# --------------------------------------------------------------------------- #
-
-
-@respx.mock
-def test_rate_limited_after_five_attempts():
-    # Wrong secret fails before any JMAP call, so no mock is needed; the limiter is
-    # checked first, so all attempts count.
-    statuses = []
-    with TestClient(app) as client:
-        for _ in range(6):
-            statuses.append(client.post("/", data={"secret": "nope"}).status_code)
-    assert statuses[:5] == [401] * 5
-    assert statuses[5] == 429
-
-
-# --------------------------------------------------------------------------- #
-# FIX 5: the rate-limiter's bucket map must stay bounded (SPEC.md §5)
-# --------------------------------------------------------------------------- #
-
-
-def test_rate_limiter_prunes_stale_ips(monkeypatch):
-    import src.discovery as disc
-
-    clock = {"t": 1000.0}
-    monkeypatch.setattr(disc.time, "monotonic", lambda: clock["t"])
-    rl = disc.RateLimiter(limit=5, window=60.0)
-    for i in range(50):
-        assert rl.allow(f"10.0.0.{i}")
-    assert len(rl._hits) == 50
-    clock["t"] += 120.0  # advance well past the window
-    rl.allow("10.9.9.9")
-    assert len(rl._hits) == 1  # all 50 stale buckets pruned, only the fresh IP remains
-
-
-def test_rate_limiter_caps_tracked_ips(monkeypatch):
-    import src.discovery as disc
-
-    clock = {"t": 1000.0}
-    monkeypatch.setattr(disc.time, "monotonic", lambda: clock["t"])
-    rl = disc.RateLimiter(limit=5, window=60.0, max_ips=100)
-    for i in range(300):  # 300 distinct IPs, all within the (frozen) window
-        rl.allow(f"10.{i // 256}.{i % 256}.1")
-    assert len(rl._hits) <= 101  # the hard cap keeps the map bounded
-
-
-# --------------------------------------------------------------------------- #
-# FIX 8: the OPML download must be an inline data: link, not a reflected secret
-# --------------------------------------------------------------------------- #
-
-
-@respx.mock
-def test_opml_download_is_data_link_not_reflected_secret():
-    _mock_jmap()
-    with TestClient(app) as client:
-        r = client.post("/", data={"secret": TEST_SECRET})
+        r = client.get("/")
     assert r.status_code == 200
     body = r.text
-    # the secret never round-trips into a hidden field or anywhere on the page
-    assert 'type="hidden" name="secret"' not in body
-    assert TEST_SECRET not in body
-    # OPML is offered as an inline data: download link carrying the feed URLs
-    assert 'href="data:text/x-opml;base64,' in body
-    m = re.search(r'href="data:text/x-opml;base64,([A-Za-z0-9+/=]+)"', body)
-    assert m is not None
-    decoded = base64.b64decode(m.group(1)).decode("utf-8")
-    assert "<opml" in decoded
-    assert "atom.xml" in decoded
+    # The calculator form fields are present.
+    assert 'id="secret"' in body
+    assert 'id="mailbox"' in body
+    # The configured BASE_URL is embedded for the client-side URL assembly.
+    assert settings.base_url in body
+
+
+def test_get_index_exposes_no_mailbox_data():
+    with TestClient(app) as client:
+        r = client.get("/")
+    body = r.text
+    # No folder tree, no folder rows, no OPML: the server sends only the static
+    # page — folder ids come from the CLI (`mail2rss folders`).
+    assert 'class="folder"' not in body
+    assert 'class="folders"' not in body
+    assert "opml;base64" not in body
+
+
+def test_get_index_keeps_hygiene_headers():
+    with TestClient(app) as client:
+        r = client.get("/")
+    assert r.headers["x-robots-tag"] == "noindex, nofollow, noarchive"
+    assert r.headers["referrer-policy"] == "no-referrer"
+    assert r.headers["cache-control"] == "no-store"
+    csp = r.headers["content-security-policy"]
+    assert "default-src 'none'" in csp
+    assert "style-src 'unsafe-inline'" in csp
+    assert "script-src 'unsafe-inline'" in csp
+
+
+# --------------------------------------------------------------------------- #
+# POST / — the route no longer exists
+# --------------------------------------------------------------------------- #
+
+
+def test_post_index_route_is_gone():
+    # Starlette answers 405 on a known path with an unsupported method: the
+    # server no longer accepts (or compares) a secret at all.
+    with TestClient(app) as client:
+        r = client.post("/", data={"secret": "whatever"})
+    assert r.status_code == 405
+
+
+# --------------------------------------------------------------------------- #
+# JS <-> Python parity: the template's self-test vector
+# --------------------------------------------------------------------------- #
+
+
+def test_selftest_vector_matches_python_implementation():
+    """Pin the in-browser WebCrypto MAC and src/crypto.py to the same bytes.
+
+    The template runs feedMac(SELFTEST...) on load and refuses to work unless it
+    reproduces SELFTEST.mac; here we recompute that same vector with the Python
+    implementation (replicating feed_mac(), but with the template's explicit
+    secret instead of settings). If either side drifts, this test goes red.
+    """
+    html = TEMPLATE_PATH.read_text(encoding="utf-8")
+    match = re.search(
+        r"SELFTEST\s*=\s*\{\s*"
+        r"secret:\s*'(?P<secret>[^']+)',\s*"
+        r"mailbox:\s*'(?P<mailbox>[^']+)',\s*"
+        r"canon:\s*'(?P<canon>[^']*)',\s*"
+        r"epoch:\s*'(?P<epoch>[^']*)',\s*"
+        r"mac:\s*'(?P<mac>[^']+)'",
+        html,
+    )
+    assert match is not None, "SELFTEST constants not found in discovery.html"
+
+    k_feed, _ = _derive_keys(match["secret"])
+    msg = b"\x00".join(
+        (
+            match["mailbox"].encode("utf-8"),
+            match["canon"].encode("utf-8"),
+            match["epoch"].encode("utf-8"),
+        )
+    )
+    mac = _b32(hmac.new(k_feed, msg, hashlib.sha256).digest())
+    assert mac == match["mac"]

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from html import escape
 
 import httpx
 
@@ -124,9 +125,36 @@ async def _cmd_feeds() -> int:
     return 0
 
 
-async def _cmd_opml() -> int:
-    from src.discovery import build_opml
+def build_opml(folders) -> str:
+    """OPML 2.0 of all listed folders' default feed URLs (SPEC.md §4.5)."""
+    # Local import: keep `gen-secret` runnable before any env exists (see module docstring).
+    from src.settings import settings
 
+    lines = [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        '<opml version="2.0">',
+        "<head><title>mail2rss</title></head>",
+        "<body>",
+    ]
+    for mailbox, path in folders:
+        epoch = settings.epoch_for(mailbox.id)
+        url = feed_url(
+            settings.base_url,
+            slugify(mailbox.name),
+            mailbox.id,
+            feed_mac(mailbox.id, FeedParams(), epoch),
+            FeedParams(),
+        )
+        text = escape(path, quote=True)
+        lines.append(
+            f'  <outline text="{text}" title="{text}" type="rss" '
+            f'xmlUrl="{escape(url, quote=True)}"/>'
+        )
+    lines += ["</body>", "</opml>"]
+    return "\n".join(lines)
+
+
+async def _cmd_opml() -> int:
     try:
         tree = await _load_tree()
     except (JmapError, JmapNotFound) as exc:

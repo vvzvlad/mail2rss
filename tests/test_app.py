@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 
 import httpx
 import pytest
@@ -290,7 +291,9 @@ def test_index_has_no_feed_list():
     with TestClient(app) as client:
         r = client.get("/")
     assert r.status_code == 200
-    assert "atom.xml" not in r.text  # no feed index anywhere
+    # No feed index anywhere: the calculator's inline JS contains the literal
+    # "/atom.xml" path suffix, but no concrete signed feed URL (no 26-char mac).
+    assert re.search(r"/f/[^/\s\"']+/[^/\s\"']+/[a-z2-7]{26}/atom\.xml", r.text) is None
     assert r.headers["X-Robots-Tag"].startswith("noindex")
 
 

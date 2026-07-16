@@ -4,9 +4,9 @@ from __future__ import annotations
 
 from urllib.parse import urlsplit
 
-from src.cli import run_cli
+from src.cli import build_opml, run_cli
 from src.crypto import validate_secret, verify_feed_mac
-from src.models import FeedParams
+from src.models import FeedParams, Mailbox
 from src.settings import settings
 
 
@@ -67,3 +67,25 @@ def test_url_default_has_no_query(capsys):
     run_cli(["url", "--mailbox", "M1"])
     url = capsys.readouterr().out.strip()
     assert url.endswith("/atom.xml")  # default params -> empty canonical query
+
+
+# --------------------------------------------------------------------------- #
+# build_opml — OPML now lives in the CLI only (SPEC.md §4.5)
+# --------------------------------------------------------------------------- #
+
+
+def test_build_opml_lists_folders_and_escapes_xml():
+    folders = [
+        (Mailbox(id="M1", name="Tech", parent_id=None, role=None, total_emails=3), "RSS/Tech"),
+        (
+            Mailbox(id="M2", name='B&W "News"', parent_id=None, role=None, total_emails=1),
+            'RSS/B&W "News"',
+        ),
+    ]
+    opml = build_opml(folders)
+    assert "<opml" in opml
+    assert opml.count("<outline") == 2  # one outline per folder
+    assert "atom.xml" in opml
+    # The path containing & and " is XML-escaped, never emitted raw.
+    assert "RSS/B&amp;W &quot;News&quot;" in opml
+    assert 'text="RSS/B&W' not in opml

@@ -46,17 +46,18 @@ a machine-generated 128-bit base32 value.
 
 ### 4. Get your feed URLs
 
-Open the service root (`BASE_URL/`), paste the secret, and the page lists your folder tree with
-a ready-to-copy feed URL per folder — plus an OPML file with all folders, which Miniflux imports
-in one go. A new folder in Fastmail needs no config change, no restart and no deploy: just come
-back to this page and copy the new link.
-
-The same table without a browser:
+List your folders and their mailbox ids with the CLI:
 
 ```bash
-make folders        # folder tree with mailbox ids
-make feeds          # the feed URL table
+make folders                                  # folder tree with mailbox ids
+make feeds                                    # the feed URL table (one signed URL per folder)
+.venv/bin/python main.py opml > feeds.opml    # OPML with all folders — Miniflux imports it in one go
 ```
+
+The service root (`BASE_URL/`) is a client-side link calculator: paste a mailbox id (from
+`make folders`) and the secret, and the feed URL is computed right in the browser — nothing is
+ever sent to the server, and the server reveals no mailbox data. A new folder in Fastmail needs
+no config change, no restart and no deploy: grab its id from `make folders` and compute the link.
 
 ## Miniflux: `MEDIA_PROXY_MODE=all` (required)
 

@@ -5,8 +5,7 @@ Routes (SPEC.md §5):
     GET  /f/{slug}/{mailbox_id}/{mac}/atom.xml        -> Atom feed (§5.1, §6)
     GET  /f/{slug}/{mailbox_id}/{mac}/e/{email_id}.html -> permalink (§9)
     GET  /f/{slug}/{mailbox_id}/{mac}/m/{blob_id}/{sig}/{name} -> media proxy (§8.1)
-    GET  /                                            -> discovery form (§4.4)
-    POST /                                            -> secret -> folder list / OPML
+    GET  /                                            -> client-side link calculator (§4.4)
     GET  /health                                      -> liveness + last JMAP probe
     GET  /robots.txt                                  -> Disallow: /
     *                                                 -> 404
@@ -50,7 +49,7 @@ from src.crypto import (
     slugify,
     verify_feed_mac,
 )
-from src.discovery import RateLimiter, render_template
+from src.discovery import render_template
 from src.feed import NS_MAIL2RSS, FeedEntry, build_atom, entry_id, error_feed
 from src.jmap import JmapClient, JmapError, JmapNotFound
 from src.mailbox_tree import MailboxTree
@@ -114,7 +113,6 @@ async def lifespan(app: FastAPI):
     app.state.cache = cache
     app.state.tree = tree
     app.state.media = MediaProxy(cache, jmap)
-    app.state.limiter = RateLimiter()
     app.state.health = HealthState()
     logger.info("app_started: base_url set")
     try:
@@ -684,11 +682,6 @@ async def media(
 @app.get("/")
 async def index() -> Response:
     return await discovery.get_index()
-
-
-@app.post("/")
-async def index_post(request: Request) -> Response:
-    return await discovery.post_index(request, request.app.state.tree, request.app.state.limiter)
 
 
 # --- Routes: ops -------------------------------------------------------------

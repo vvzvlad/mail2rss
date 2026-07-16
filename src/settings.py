@@ -51,9 +51,10 @@ class Settings(BaseSettings):
     @field_validator("mail2rss_secret")
     @classmethod
     def _check_secret(cls, value: str) -> str:
-        # A weak secret must PREVENT STARTUP (SPEC.md §4.4 p.1). This — not any
-        # check in the discovery form — is what keeps `hunter2` out of the env.
-        # The message never echoes the value back.
+        # A weak secret must PREVENT STARTUP (SPEC.md §4.4 p.1). The secret is
+        # validated here once, at startup; nothing else ever re-checks it (the
+        # link-calculator page computes MACs in the browser and never sends the
+        # secret to the server). The message never echoes the value back.
         if not validate_secret(value):
             raise ValueError(
                 "must be a machine-generated 128-bit base32 secret "
