@@ -9,6 +9,7 @@ would ship broken links into every feed).
 
 from __future__ import annotations
 
+import fnmatch
 import re
 from urllib.parse import urlparse
 
@@ -43,6 +44,7 @@ class Settings(BaseSettings):
     mailbox_tree_ttl: int = 3600  # seconds (§6.1)
     media_cache_max_mb: int = 500  # LRU cap for the on-disk blob cache (§3.2)
     mail2rss_epoch: str = ""  # "M9f3ac21b:2,M77bb01c:5" — per-folder revocation (§4.7)
+    mail2rss_allowed_folders: str = ""  # "Newsletters,Newsletters/*" — hard folder allowlist (§4.8)
     log_level: str = "INFO"
     cache_db_path: str = "data/cache.db"  # all mutable state lives under data/
 
@@ -80,7 +82,7 @@ class Settings(BaseSettings):
         # Fail loudly on a malformed entry: silently ignoring it would mean a
         # revocation the operator believes is in effect is not, in fact, applied.
         seen: set[str] = set()
-        for entry in _split_epoch(value):
+        for entry in _split_csv(value):
             match = _EPOCH_ENTRY_RE.match(entry)
             if not match:
                 raise ValueError(
@@ -93,6 +95,19 @@ class Settings(BaseSettings):
             seen.add(mailbox_id)
         return value
 
+    @field_validator("mail2rss_allowed_folders")
+    @classmethod
+    def _check_allowed_folders(cls, value: str) -> str:
+        # Fail loudly: a non-blank value that parses to ZERO patterns (e.g. " , ,")
+        # would silently mean "allow everything" while the operator believes a
+        # restriction is in effect — refuse to start instead (same rule as epoch).
+        if value.strip() and not _split_csv(value):
+            raise ValueError(
+                "is non-empty but contains no patterns; expected comma-separated "
+                "fnmatch globs over folder paths, e.g. 'Newsletters,Newsletters/*'"
+            )
+        return value
+
     @property
     def epochs(self) -> dict[str, str]:
         """Parsed MAIL2RSS_EPOCH: {mailbox_id: counter} (§4.7).
@@ -100,7 +115,7 @@ class Settings(BaseSettings):
         Flat ENV, parsed in a property — house rule for lists/maps in config.
         """
         result: dict[str, str] = {}
-        for entry in _split_epoch(self.mail2rss_epoch):
+        for entry in _split_csv(self.mail2rss_epoch):
             match = _EPOCH_ENTRY_RE.match(entry)
             if match:
                 result[match.group(1)] = match.group(2)
@@ -111,11 +126,36 @@ class Settings(BaseSettings):
         return self.epochs.get(mailbox_id, "")
 
     @property
+    def allowed_folder_patterns(self) -> list[str]:
+        """Parsed MAIL2RSS_ALLOWED_FOLDERS: fnmatch globs over folder paths (§4.8).
+
+        Flat ENV, parsed in a property — house rule for lists/maps in config.
+        """
+        return _split_csv(self.mail2rss_allowed_folders)
+
+    def folder_allowed(self, path: str) -> bool:
+        """True iff the folder path passes MAIL2RSS_ALLOWED_FOLDERS.
+
+        The allowlist caps the blast radius of a leaked feed URL or even a leaked
+        MAIL2RSS_SECRET: even a valid MAC for a non-matching folder serves nothing
+        (SPEC.md §4.8; complements the per-folder epoch revocation, §4.7).
+
+        An empty allowlist means no restriction. Matching is fnmatch.fnmatchcase
+        (deterministic, case-sensitive; fnmatch.fnmatch would fold case on macOS):
+        '*' crosses '/' (fnmatch is not path-aware), so 'Newsletters/*' covers the
+        whole subtree; add 'Newsletters' itself as a separate pattern if needed.
+        """
+        patterns = self.allowed_folder_patterns
+        if not patterns:
+            return True
+        return any(fnmatch.fnmatchcase(path, p) for p in patterns)
+
+    @property
     def media_cache_max_bytes(self) -> int:
         return self.media_cache_max_mb * 1024 * 1024
 
 
-def _split_epoch(value: str) -> list[str]:
+def _split_csv(value: str) -> list[str]:
     return [item.strip() for item in value.split(",") if item.strip()]
 
 

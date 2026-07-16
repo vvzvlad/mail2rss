@@ -12,7 +12,7 @@ from lxml import etree
 from starlette.testclient import TestClient
 
 from src.app import app
-from src.crypto import canon_params, feed_mac, feed_url
+from src.crypto import canon_params, feed_mac, feed_url, media_sig
 from src.feed import ATOM_NS
 from src.models import FeedParams
 from src.settings import settings
@@ -63,6 +63,7 @@ class JmapMock:
         self.emails = emails
         self.fail_emails = False
         self.last_query_limit = None
+        self.last_query_filter = None
         self.email_call_count = 0
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
@@ -79,6 +80,7 @@ class JmapMock:
                 responses.append(["Mailbox/get", {"accountId": ACCOUNT_ID, "list": self.mailboxes}, cid])
             elif name == "Email/query":
                 self.last_query_limit = args.get("limit")
+                self.last_query_filter = args.get("filter")
                 responses.append(
                     ["Email/query", {"accountId": ACCOUNT_ID, "ids": [e["id"] for e in self.emails]}, cid]
                 )
@@ -482,3 +484,122 @@ def test_stale_tree_missing_folder_forces_refresh_and_serves_entries():
     title = root.find(f"{_ATOM}entry/{_ATOM}title").text
     # A forced refresh found M1 -> real entries, NOT the "folder deleted" feed.
     assert title == "Weekly digest"
+
+
+# --------------------------------------------------------------------------- #
+# Hard folder allowlist (SPEC.md §4.8)
+# --------------------------------------------------------------------------- #
+
+
+@respx.mock
+def test_allowlist_matching_folder_is_served(monkeypatch):
+    _mock_jmap()  # M1 "Tech" -> path "Tech"
+    monkeypatch.setattr(settings, "mail2rss_allowed_folders", "Tech")
+    with TestClient(app) as client:
+        r = client.get(_feed_path())
+    assert r.status_code == 200
+    root = etree.fromstring(r.content)
+    assert root.find(f"{_ATOM}entry") is not None
+
+
+@respx.mock
+def test_allowlist_blocked_folder_bare_404_no_email_query(monkeypatch):
+    mock = _mock_jmap()
+    monkeypatch.setattr(settings, "mail2rss_allowed_folders", "Newsletters")
+    with TestClient(app) as client:
+        blocked = client.get(_feed_path())
+        bad_mac = client.get("/f/tech/M1/aaaaaaaaaaaaaaaaaaaaaaaaaa/atom.xml")
+    # Bare 404, byte-identical to the invalid-MAC 404: no body, no explanation
+    # feed, nothing confirmed.
+    assert blocked.status_code == 404
+    assert blocked.content == b""
+    assert blocked.status_code == bad_mac.status_code
+    assert blocked.content == bad_mac.content
+    assert blocked.headers.get("content-type") == bad_mac.headers.get("content-type")
+    # The gate short-circuits before JMAP is asked for any mail.
+    assert mock.email_call_count == 0
+
+
+@respx.mock
+def test_allowlist_gate_runs_before_cache(monkeypatch):
+    _mock_jmap()
+    with TestClient(app) as client:
+        r1 = client.get(_feed_path())
+        assert r1.status_code == 200  # primes the SQLite feed cache (fresh entry)
+        # A NEW pattern now blocks the folder: the cached body must NOT be served
+        # even though it is younger than cache_ttl — the gate runs first.
+        monkeypatch.setattr(settings, "mail2rss_allowed_folders", "Newsletters")
+        r2 = client.get(_feed_path())
+    assert r2.status_code == 404
+    assert r2.content == b""
+
+
+@respx.mock
+def test_allowlist_filters_blocked_children_from_aggregate_query(monkeypatch):
+    m_ok = {"id": "M2", "name": "Allowed", "parentId": "M1", "role": None, "totalEmails": 1}
+    m_no = {"id": "M3", "name": "Blocked", "parentId": "M1", "role": None, "totalEmails": 1}
+    mock = _mock_jmap(mailboxes=[MAILBOX_M1, m_ok, m_no])
+    monkeypatch.setattr(settings, "mail2rss_allowed_folders", "Tech,Tech/Allowed")
+    with TestClient(app) as client:
+        r = client.get(_feed_path(params=FeedParams(children=True)))
+    assert r.status_code == 200
+    # The JMAP OR filter covers the parent and the allowed child only: the
+    # blocked subfolder must not leak through the parent's aggregate feed.
+    fltr = mock.last_query_filter
+    if "conditions" in fltr:
+        ids = {cond["inMailbox"] for cond in fltr["conditions"]}
+    else:
+        ids = {fltr["inMailbox"]}
+    assert "M1" in ids
+    assert "M2" in ids
+    assert "M3" not in ids
+
+
+@respx.mock
+def test_allowlist_blocked_permalink_and_media_are_404(monkeypatch):
+    mock = _mock_jmap()
+    monkeypatch.setattr(settings, "mail2rss_allowed_folders", "Newsletters")
+    download = respx.get(url__regex=r"https://download\.fastmail\.test/.*").mock(
+        return_value=httpx.Response(200, content=b"PNGDATA")
+    )
+    mac = feed_mac("M1", FeedParams(), "")
+    sig = media_sig(mac, "B1")
+    with TestClient(app) as client:
+        rp = client.get(f"/f/tech/M1/{mac}/e/E1.html")
+        rm = client.get(f"/f/tech/M1/{mac}/m/B1/{sig}/img.png?ct=image%2Fpng")
+    assert rp.status_code == 404 and rp.content == b""
+    assert rm.status_code == 404 and rm.content == b""
+    # Neither the email nor the blob was ever fetched from Fastmail.
+    assert mock.email_call_count == 0
+    assert download.call_count == 0
+
+
+@respx.mock
+def test_allowlist_media_bad_mac_short_circuits_before_gate(monkeypatch):
+    # Ordering pin: on the media route the MAC check runs BEFORE the folder
+    # gate, so a prober holding no valid MAC never triggers a mailbox-tree
+    # refresh — response timing cannot leak whether a blocked folder exists.
+    respx.get(SESSION_URL).mock(return_value=httpx.Response(200, json=SESSION_JSON))
+    api = respx.post(API_URL).mock(side_effect=JmapMock([MAILBOX_M1], [EMAIL_1]))
+    monkeypatch.setattr(settings, "mail2rss_allowed_folders", "Newsletters")  # blocks "Tech"
+    bad_mac = "aaaaaaaaaaaaaaaaaaaaaaaaaa"
+    sig = media_sig(bad_mac, "B1")
+    with TestClient(app) as client:
+        r = client.get(f"/f/tech/M1/{bad_mac}/m/B1/{sig}/img.png?ct=image%2Fpng")
+    assert r.status_code == 404
+    assert r.content == b""
+    # The gate never ran: no Mailbox/get (or any other JMAP call) was made.
+    assert not api.called
+
+
+@respx.mock
+def test_allowlist_no_tree_fails_closed_503(monkeypatch):
+    # Allowlist on, first boot during a Fastmail outage: no tree at all (not even
+    # the kv fallback — the cache is fresh per test) -> fail CLOSED, never open.
+    respx.get(SESSION_URL).mock(return_value=httpx.Response(200, json=SESSION_JSON))
+    respx.post(API_URL).mock(return_value=httpx.Response(500, text="down"))
+    monkeypatch.setattr(settings, "mail2rss_allowed_folders", "Tech")
+    with TestClient(app) as client:
+        r = client.get(_feed_path())
+    assert r.status_code == 503
+    assert r.headers["Retry-After"] == "300"

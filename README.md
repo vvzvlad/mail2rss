@@ -88,6 +88,7 @@ A commented-out Miniflux service block is included in `docker-compose.yml`.
 | `MAX_LIMIT` | no | `100` | Server-side ceiling on `?limit=`, forced regardless of the URL signature. |
 | `MAILBOX_TREE_TTL` | no | `3600` | Seconds the folder tree is cached; a new folder appears without a restart. |
 | `MAIL2RSS_EPOCH` | no | *(empty)* | Per-folder URL revocation counters, e.g. `M9f3ac21b:2,M77bb01c:5`. Bumping one changes only that folder's URL. |
+| `MAIL2RSS_ALLOWED_FOLDERS` | no | *(empty)* | Hard server-side allowlist: comma-separated glob patterns over folder paths, e.g. `Newsletters,Newsletters/*`. Empty = all folders. Non-matching folders silently 404, even with a valid URL. |
 | `LOG_LEVEL` | no | `INFO` | Log level. |
 | `CACHE_DB_PATH` | no | `data/cache.db` | SQLite cache file; keep it under `data/`. |
 

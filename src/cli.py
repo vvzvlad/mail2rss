@@ -98,13 +98,21 @@ async def _load_tree(include_system: bool = True) -> MailboxTree:
 
 
 async def _cmd_folders() -> int:
+    from src.settings import settings
+
     try:
         tree = await _load_tree()
     except (JmapError, JmapNotFound) as exc:
         print(f"error: could not list folders: {exc}")
         return 1
+    # `folders` is a raw-tree inspection tool: it lists EVERYTHING, but marks the
+    # rows the server would silently 404 (SPEC.md §4.8) so the operator can debug
+    # the allowlist patterns.
+    mark_excluded = bool(settings.allowed_folder_patterns)
     for mailbox, path in tree.list_folders(include_system=True):
         tag = f" [{mailbox.role}]" if mailbox.role else ""
+        if mark_excluded and not settings.folder_allowed(path):
+            tag += " [excluded by MAIL2RSS_ALLOWED_FOLDERS]"
         print(f"{mailbox.id}\t{path}{tag}\t({mailbox.total_emails} emails)")
     return 0
 
@@ -118,6 +126,9 @@ async def _cmd_feeds() -> int:
         print(f"error: could not list folders: {exc}")
         return 1
     for mailbox, path in tree.list_folders(include_system=False):
+        # Emitting a URL the server will silently 404 would be a lie (§4.8).
+        if not settings.folder_allowed(path):
+            continue
         epoch = settings.epoch_for(mailbox.id)
         mac = feed_mac(mailbox.id, FeedParams(), epoch)
         url = feed_url(settings.base_url, slugify(mailbox.name), mailbox.id, mac, FeedParams())
@@ -126,7 +137,11 @@ async def _cmd_feeds() -> int:
 
 
 def build_opml(folders) -> str:
-    """OPML 2.0 of all listed folders' default feed URLs (SPEC.md §4.5)."""
+    """OPML 2.0 of the listed folders' default feed URLs (SPEC.md §4.5).
+
+    Folders excluded by MAIL2RSS_ALLOWED_FOLDERS are skipped: emitting a URL the
+    server will silently 404 would be a lie (SPEC.md §4.8).
+    """
     # Local import: keep `gen-secret` runnable before any env exists (see module docstring).
     from src.settings import settings
 
@@ -137,6 +152,8 @@ def build_opml(folders) -> str:
         "<body>",
     ]
     for mailbox, path in folders:
+        if not settings.folder_allowed(path):
+            continue
         epoch = settings.epoch_for(mailbox.id)
         url = feed_url(
             settings.base_url,

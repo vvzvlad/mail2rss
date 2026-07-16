@@ -55,6 +55,10 @@ services:
       # Bumping a counter changes the URL of that folder only. Empty by default.
       # MAIL2RSS_EPOCH: ""
 
+      # Hard folder allowlist: comma-separated fnmatch globs over full folder
+      # paths, e.g. "Newsletters,Newsletters/*" (SPEC.md §4.8). Empty by default.
+      # MAIL2RSS_ALLOWED_FOLDERS: ""
+
       # LOG_LEVEL: INFO
 
       # SQLite cache file — always under data/, which is the mounted volume.

@@ -454,6 +454,43 @@ def _build_error_feed(mailbox_id: str, mac: str, slug: str, signed_params: FeedP
     )
 
 
+# --- Hard folder allowlist gate (SPEC.md §4.8) --------------------------------
+
+
+async def _folder_gate(tree: MailboxTree, mailbox_id: str) -> str:
+    """Resolve the hard folder allowlist verdict for a mailbox (SPEC.md §4.8).
+
+    The allowlist caps the blast radius of a leaked feed URL or even a leaked
+    MAIL2RSS_SECRET — even a valid MAC for a non-matching folder serves nothing.
+    It complements the per-folder epoch revocation (SPEC.md §4.7).
+
+    Returns one of:
+      'allowed' — no allowlist configured, or the folder path matches it;
+      'blocked' — the folder exists and its path does NOT match: the caller
+                  must answer with a bare 404, indistinguishable from a bad MAC;
+      'unknown' — the folder is not in the tree (deleted): fall through to the
+                  route's existing semantics (explanation feed / proxy 4xx);
+      'no-tree' — allowlist is on but no tree exists at all (first boot during
+                  a Fastmail outage): fail CLOSED with 503, never fail open.
+    """
+    if not settings.allowed_folder_patterns:
+        return "allowed"
+    try:
+        await tree.ensure_fresh()
+    except (JmapError, JmapNotFound):
+        pass  # keep the last good tree; fail closed below if there is none
+    if not tree.has_tree:
+        return "no-tree"
+    if tree.get(mailbox_id) is None:
+        return "unknown"
+    if settings.folder_allowed(tree.path_of(mailbox_id)):
+        return "allowed"
+    # A single debug line only: 'blocked' must stay indistinguishable from a bad
+    # MAC in the regular access logs (SPEC.md §4.8).
+    logger.debug(f"folder_gate_blocked: mailbox_id {mailbox_id}")
+    return "blocked"
+
+
 # --- Routes: feed ------------------------------------------------------------
 
 
@@ -472,6 +509,18 @@ async def feed(slug: str, mailbox_id: str, mac: str, request: Request) -> Respon
     jmap: JmapClient = request.app.state.jmap
     health: HealthState = request.app.state.health
 
+    # Hard allowlist gate (SPEC.md §4.8) — MUST run before the cache read: the
+    # SQLite feed cache survives restarts, so a folder blocked by a NEW pattern
+    # after a restart must not keep serving its cached body until cache_ttl
+    # expires. The stale cache entry is left in place to age out naturally; it
+    # is unreachable while blocked. 'unknown' (deleted folder) falls through to
+    # the existing explanation-feed semantics.
+    verdict = await _folder_gate(tree, mailbox_id)
+    if verdict == "blocked":
+        return Response(status_code=404)  # bare, byte-identical to a bad MAC
+    if verdict == "no-tree":
+        return Response(status_code=503, headers={"Retry-After": "300"})
+
     cache_key = mailbox_id + "\0" + canon_params(signed_params)
 
     # Fresh cache (< cache_ttl) -> serve it, honouring If-None-Match (SPEC.md §6.3).
@@ -480,7 +529,13 @@ async def feed(slug: str, mailbox_id: str, mac: str, request: Request) -> Respon
         return _feed_response(request, entry.body, entry.etag)
 
     try:
-        await tree.ensure_fresh()
+        if not settings.allowed_folder_patterns:
+            # With the allowlist on, _folder_gate just ran ensure_fresh() and let
+            # the request through only with a tree present — so skipping this
+            # call never changes behavior (ensure_fresh raises only with no tree
+            # at all); it merely avoids a second failing JMAP refresh per
+            # request during a Fastmail outage.
+            await tree.ensure_fresh()
         mailbox = tree.get(mailbox_id)
         if mailbox is None:
             # A stale or kv-restored tree can report a genuinely-existing folder as
@@ -499,7 +554,13 @@ async def feed(slug: str, mailbox_id: str, mac: str, request: Request) -> Respon
                 return await _serve_error_feed(request, mailbox_id, mac, slug, signed_params)
         fetch_ids = [mailbox_id]
         if signed_params.children:
-            fetch_ids += tree.children_ids(mailbox_id)
+            child_ids = tree.children_ids(mailbox_id)
+            if settings.allowed_folder_patterns:
+                # A blocked subfolder must not leak its mail through an allowed
+                # parent's aggregate feed (SPEC.md §4.8). With the allowlist off
+                # this filter is skipped entirely — zero extra work by default.
+                child_ids = [cid for cid in child_ids if settings.folder_allowed(tree.path_of(cid))]
+            fetch_ids += child_ids
         emails = await jmap.query_emails(fetch_ids, _fetch_limit(signed_params))
         health.record(True)
     except JmapNotFound:
@@ -587,6 +648,14 @@ async def permalink(slug: str, mailbox_id: str, mac: str, email_id: str, request
     tree: MailboxTree = request.app.state.tree
     health: HealthState = request.app.state.health
 
+    # Hard allowlist gate (SPEC.md §4.8): a blocked folder's permalink is a bare
+    # 404, indistinguishable from a bad MAC; fail closed when there is no tree.
+    verdict = await _folder_gate(tree, mailbox_id)
+    if verdict == "blocked":
+        return Response(status_code=404)
+    if verdict == "no-tree":
+        return Response(status_code=503, headers={"Retry-After": "300"})
+
     try:
         email = await jmap.get_email(email_id)
         health.record(True)
@@ -604,11 +673,21 @@ async def permalink(slug: str, mailbox_id: str, mac: str, email_id: str, request
     # feed's link would read mail from any folder (SPEC.md §5.1 p.6).
     allowed = {mailbox_id}
     if signed_params.children:
-        try:
-            await tree.ensure_fresh()
-        except JmapError:
-            pass  # fall back to whatever tree we have
-        allowed.update(tree.children_ids(mailbox_id))
+        if not settings.allowed_folder_patterns:
+            # With the allowlist on, _folder_gate just ran ensure_fresh() with a
+            # tree present; a second call here could only re-fire a failing JMAP
+            # refresh during an outage, never change the outcome.
+            try:
+                await tree.ensure_fresh()
+            except JmapError:
+                pass  # fall back to whatever tree we have
+        child_ids = tree.children_ids(mailbox_id)
+        if settings.allowed_folder_patterns:
+            # A blocked subfolder must not become readable through its parent's
+            # signed children=1 permalinks (SPEC.md §4.8). With the allowlist
+            # off this filter is skipped entirely — zero extra work by default.
+            child_ids = [cid for cid in child_ids if settings.folder_allowed(tree.path_of(cid))]
+        allowed.update(child_ids)
     if not (set(email.mailbox_ids) & allowed):
         return Response(status_code=410)
 
@@ -663,6 +742,20 @@ async def media(
     signed_params = _parse_signed_params(request)
     epoch = settings.epoch_for(mailbox_id)
     proxy: MediaProxy = request.app.state.media
+    # The gate below must be unreachable without a valid MAC (as on the feed and
+    # permalink routes): otherwise response timing would leak folder existence to
+    # probers holding no secret at all. proxy.handle() re-verifies internally —
+    # that redundancy is deliberate (defense in depth), not removable.
+    if not verify_feed_mac(mac, mailbox_id, signed_params, epoch):
+        return Response(status_code=404)
+    # Hard allowlist gate (SPEC.md §4.8): media URLs live forever in Miniflux
+    # entry HTML, so a hard restriction must also stop the media proxy, not only
+    # the feed. Same bare-404 semantics as a bad MAC; fail closed with no tree.
+    verdict = await _folder_gate(request.app.state.tree, mailbox_id)
+    if verdict == "blocked":
+        return Response(status_code=404)
+    if verdict == "no-tree":
+        return Response(status_code=503, headers={"Retry-After": "300"})
     return await proxy.handle(
         mailbox_id=mailbox_id,
         mac=mac,

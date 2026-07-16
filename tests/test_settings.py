@@ -118,6 +118,64 @@ def test_epoch_malformed_rejected(monkeypatch):
         Settings(_env_file=None)
 
 
+def test_allowed_folders_patterns_parse_split_strip_drop_empty(monkeypatch):
+    _set_valid(monkeypatch)
+    monkeypatch.setenv("MAIL2RSS_ALLOWED_FOLDERS", " Newsletters , Newsletters/* ,, ")
+    s = Settings(_env_file=None)
+    assert s.allowed_folder_patterns == ["Newsletters", "Newsletters/*"]
+
+
+def test_allowed_folders_empty_by_default(monkeypatch):
+    _set_valid(monkeypatch)
+    monkeypatch.delenv("MAIL2RSS_ALLOWED_FOLDERS", raising=False)
+    s = Settings(_env_file=None)
+    assert s.allowed_folder_patterns == []
+    # Empty allowlist means no restriction: everything passes.
+    assert s.folder_allowed("Anything") is True
+    assert s.folder_allowed("Deep/Nested/Path") is True
+
+
+def test_allowed_folders_nonblank_but_zero_patterns_refuses_startup(monkeypatch):
+    # " , ," is non-blank but parses to zero patterns: an operator who believes a
+    # restriction is in effect must not silently get "allow everything".
+    _set_valid(monkeypatch)
+    monkeypatch.setenv("MAIL2RSS_ALLOWED_FOLDERS", " , ,")
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None)
+
+
+def test_folder_allowed_exact_and_subtree_matching(monkeypatch):
+    _set_valid(monkeypatch)
+    monkeypatch.setenv("MAIL2RSS_ALLOWED_FOLDERS", "Newsletters,Newsletters/*")
+    s = Settings(_env_file=None)
+    assert s.folder_allowed("Newsletters") is True
+    # '*' crosses '/' (fnmatch is not path-aware): the whole subtree matches.
+    assert s.folder_allowed("Newsletters/Tech") is True
+    assert s.folder_allowed("Newsletters/Tech/Weekly") is True
+    assert s.folder_allowed("Other") is False
+    assert s.folder_allowed("NewslettersX") is False
+
+
+def test_folder_allowed_is_case_sensitive(monkeypatch):
+    # fnmatchcase, not fnmatch: the latter folds case per-OS (e.g. on macOS).
+    _set_valid(monkeypatch)
+    monkeypatch.setenv("MAIL2RSS_ALLOWED_FOLDERS", "Newsletters")
+    s = Settings(_env_file=None)
+    assert s.folder_allowed("Newsletters") is True
+    assert s.folder_allowed("newsletters") is False
+
+
+def test_folder_allowed_escaped_slash_in_name_does_not_match_path_pattern(monkeypatch):
+    # A folder literally NAMED "a/b" has the path "a\/b" (MailboxTree.path_of
+    # escapes the literal '/'), so the pattern "a/b" — which describes a parent
+    # "a" with a child "b" — does NOT match it.
+    _set_valid(monkeypatch)
+    monkeypatch.setenv("MAIL2RSS_ALLOWED_FOLDERS", "a/b")
+    s = Settings(_env_file=None)
+    assert s.folder_allowed("a/b") is True
+    assert s.folder_allowed("a\\/b") is False
+
+
 def test_media_cache_bytes_derived(monkeypatch):
     _set_valid(monkeypatch)
     monkeypatch.setenv("MEDIA_CACHE_MAX_MB", "10")
