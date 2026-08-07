@@ -9,7 +9,6 @@ on:
 
 permissions:
   contents: read   # checkout
-  packages: write  # push image to ghcr.io
 
 jobs:
   test:
@@ -42,21 +41,23 @@ jobs:
     steps:
     - uses: actions/checkout@v7
 
-    - name: Log in to GitHub Container Registry
-      uses: docker/login-action@v4
+    - name: Log in to the Gitea container registry
+      uses: docker/login-action@v3
       with:
-        registry: ghcr.io
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
+        registry: gitea.vvzvlad.xyz
+        username: ${{ github.repository_owner }}
+        # Org-level secret on `projects`; the built-in GITEA_TOKEN has no
+        # package scope and cannot push images.
+        password: ${{ secrets.REGISTRY_TOKEN }}
 
     - name: Compute image tags
       id: tags
       # main -> :latest + :<sha> (watchtower deploys :latest); develop -> :develop only
       run: |
         if [ "${{ github.ref_name }}" = "main" ]; then
-          echo "tags=ghcr.io/${{ github.repository }}:latest ghcr.io/${{ github.repository }}:${{ github.sha }}" >> "$GITHUB_OUTPUT"
+          echo "tags=gitea.vvzvlad.xyz/${{ github.repository }}:latest gitea.vvzvlad.xyz/${{ github.repository }}:${{ github.sha }}" >> "$GITHUB_OUTPUT"
         else
-          echo "tags=ghcr.io/${{ github.repository }}:develop" >> "$GITHUB_OUTPUT"
+          echo "tags=gitea.vvzvlad.xyz/${{ github.repository }}:develop" >> "$GITHUB_OUTPUT"
         fi
 
     - name: Build the Docker image
