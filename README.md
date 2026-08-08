@@ -97,7 +97,7 @@ The full list also lives in `.env.example`, and `docker-compose.yml` documents e
 ## Deployment
 
 Production does not build the image — CI does. Push to `main` → tests run → the image is built
-and pushed to `ghcr.io/vvzvlad/mail2rss:latest` → watchtower picks it up. Red tests physically
+and pushed to `gitea.vvzvlad.xyz/projects/mail2rss:latest` → watchtower picks it up. Red tests physically
 cannot produce an image (`build` has `needs: test`).
 
 ```bash

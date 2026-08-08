@@ -581,7 +581,7 @@ settings = load_settings_or_exit(Settings)
 - База `python:3.12-slim`, `WORKDIR /app`, зависимости отдельным слоем до кода, `--no-cache-dir`, `RUN mkdir -p data`, exec-форма `CMD`, **без `EXPOSE`**.
 - `curl` ставится обязательно — его дёргает healthcheck из compose.
 - `.dockerignore` отсекает `data/`, `tests/`, `.env`, `.github/`, `*.md`.
-- Прод не собирает: образ из `ghcr.io/vvzvlad/mail2rss:latest`, обновление — watchtower по лейблу.
+- Прод не собирает: образ из `gitea.vvzvlad.xyz/projects/mail2rss:latest`, обновление — watchtower по лейблу.
 - Наружу — через Traefik по лейблам (`loadBalancer.server.port: 8000`, `entrypoints: websecure`, `tls.certresolver: letsEncrypt`). TLS/HSTS — на Traefik, в приложении их нет.
 - Healthcheck: `curl -sf http://127.0.0.1:8000/health` с `interval: 15s` и `start_period: 30s` (за Traefik короткий интервал обязателен, иначе контейнер долго висит нерouted).
 - Логи: `json-file` с ротацией (`max-size: 10m`, `max-file: 5`), `TZ: Europe/Moscow`.

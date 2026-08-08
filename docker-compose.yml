@@ -1,4 +1,4 @@
-# Deploy template for mail2rss. Pull the prebuilt image from ghcr.io — do NOT build on prod.
+# Deploy template for mail2rss. Pull the prebuilt image from the Gitea registry — do NOT build on prod.
 # Every value below is a PLACEHOLDER (XXX / example.com), never a real secret.
 #
 # This file doubles as env documentation: each variable is annotated with its
@@ -13,7 +13,7 @@ networks:
 
 services:
   mail2rss:
-    image: ghcr.io/vvzvlad/mail2rss:latest
+    image: gitea.vvzvlad.xyz/projects/mail2rss:latest
     container_name: mail2rss
     restart: always
     volumes:

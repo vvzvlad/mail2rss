@@ -1,0 +1,52 @@
+name: Tests
+
+# Split out from image-check-publish.yml on purpose: that workflow must never
+# run on pull_request, because a PR build would push :latest and watchtower
+# would deploy it to prod within two minutes. Tests alone are safe here and are
+# what a PR actually needs — without this workflow a broken test only surfaces
+# after the merge into main.
+# Both base branches are listed because the image workflow builds both.
+on:
+  # Manual re-run: without it a run that flaked on runner networking could only be
+  # retried by pushing an empty commit to the PR branch. Safe to expose here — this
+  # workflow touches no registry and no secrets, it only runs the test suite.
+  workflow_dispatch:
+  pull_request:
+    branches: [ "main", "develop" ]
+
+permissions:
+  contents: read   # checkout
+
+# Unlike the image workflow, cancelling is right here: this job produces no
+# artifacts, so a superseded test run is just wasted runner time.
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+# Keep this job byte-identical to the `test` job in image-check-publish.yml:
+# the PR gate and the pre-build gate must be the same gate, or a PR goes green
+# on a weaker check than the one that guards the image.
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v7
+
+    - name: Set up Python
+      uses: actions/setup-python@v6
+      with:
+        python-version: "3.12"   # same as the Dockerfile base image
+
+    - name: Install dependencies
+      run: pip install -r requirements-dev.txt
+
+    - name: Run tests
+      env:
+        # src/settings.py validates these at import time, so the test job must
+        # provide them. All three are PLACEHOLDERS — none is a real credential.
+        FASTMAIL_API_TOKEN: ci-placeholder-not-a-real-token
+        # Fake, but syntactically valid: 26 lowercase base32 chars, no padding
+        # (128 bits) — the startup format check rejects anything else.
+        MAIL2RSS_SECRET: ci7fake7secret7not7real7za
+        BASE_URL: https://rss.example.com
+      run: pytest --tb=short -q
